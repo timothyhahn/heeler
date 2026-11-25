@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import socket
 import subprocess
 import sys
 import tempfile
@@ -184,6 +185,125 @@ def check_renames(client, root, tools):
             expect_error({}, message, native_calls=1)
 
 
+def check_tab_close(binary, tool):
+    schema = tool["inputSchema"]
+    assert set(schema["required"]) == {"session", "tab_id"}
+    assert schema["additionalProperties"] is False
+    assert all(schema["properties"][field]["type"] == "string" for field in ["session", "tab_id"])
+    annotations = tool["annotations"]
+    assert annotations["readOnlyHint"] is False and annotations["destructiveHint"] is True
+    assert annotations["idempotentHint"] is False
+    snapshot = json.loads((Path(__file__).parent / "fixtures" / "herdr-0.9.5-snapshot.json").read_text())["result"]["snapshot"]
+    workspace, tab, pane = snapshot["workspaces"][0], snapshot["tabs"][0], snapshot["panes"][0]
+    workspace.update(tab_count=2, pane_count=2)
+    snapshot["tabs"].append({**tab, "tab_id": "w1:t2", "number": 2, "focused": False})
+    snapshot["panes"].append({**pane, "pane_id": "w1:p2", "terminal_id": "term_worker", "tab_id": "w1:t2", "focused": False})
+    snapshot["agents"].append({**snapshot["agents"][0], "pane_id": "w1:p2", "terminal_id": "term_worker", "tab_id": "w1:t2", "focused": False})
+    snapshot["workspaces"].append({**workspace, "workspace_id": "w2", "active_tab_id": "w2:t1", "tab_count": 1, "pane_count": 1, "focused": False})
+    snapshot["tabs"].append({**tab, "workspace_id": "w2", "tab_id": "w2:t1", "focused": False})
+    snapshot["panes"].append({**pane, "workspace_id": "w2", "tab_id": "w2:t1", "pane_id": "w2:p1", "terminal_id": "term_other", "focused": False})
+    with tempfile.TemporaryDirectory(prefix="heeler-close-", dir="/tmp") as directory:
+        root = Path(directory)
+        state_path = root / "native.json"
+        fake = root / "herdr"
+        fake.write_text(f"#!{sys.executable}\n" + (Path(__file__).parent / "fake_herdr.py").read_text())
+        fake.chmod(0o700)
+
+        def reset(**fields):
+            state_path.write_text(json.dumps({"snapshot": snapshot, **fields}))
+
+        def state():
+            return json.loads(state_path.read_text())
+
+        def close(tab_id="w1:t2", session="default"):
+            return client.tool("tab_close", {"session": session, "tab_id": tab_id})
+
+        def expect_error(result, text):
+            assert result.get("isError") and text in result["structuredContent"]["error"], result
+
+        reset()
+        client = Client(binary, root)
+        try:
+            for target in ["w1:t2", "w1:t1"]:
+                reset()
+                assert structured(close(target)) == {"session": "default", "tab_id": target, "acknowledged": True}
+                after = state()
+                assert after["calls"] == [["--session=default", "tab", "get", target],
+                                          ["--session=default", "workspace", "get", "w1"],
+                                          ["--session=default", "tab", "close", target]]
+                assert [t["tab_id"] for t in after["snapshot"]["tabs"]] == [t["tab_id"] for t in snapshot["tabs"] if t["tab_id"] != target]
+                removed = {p["pane_id"] for p in snapshot["panes"] if p["tab_id"] == target}
+                assert {p["pane_id"] for p in after["snapshot"]["panes"]} == {p["pane_id"] for p in snapshot["panes"]} - removed
+                assert {a["pane_id"] for a in after["snapshot"]["agents"]} == {a["pane_id"] for a in snapshot["agents"]} - removed
+                assert len(after["snapshot"]["workspaces"]) == 2
+                for collection in ["workspaces", "tabs", "panes"]:
+                    assert [item for item in after["snapshot"][collection] if item["workspace_id"] == "w2"] == [item for item in snapshot[collection] if item["workspace_id"] == "w2"]
+                expected_focus = "w1:t1" if target == "w1:t2" else "w1:t2"
+                assert after["snapshot"]["focused_tab_id"] == expected_focus
+                assert after["snapshot"]["focused_workspace_id"] == "w1"
+
+            reset()
+            for arguments in [{"tab_id": "w1:t2"}, {"session": "default"},
+                              {"session": "default", "tab_id": "w1:t2", "force": True}]:
+                result = client.tool("tab_close", arguments)
+                assert result.get("isError"), result
+                assert "failed to deserialize parameters" in result["content"][0]["text"], result
+            for target in ["", "--help", "--", "w1", "w1:p1", "w1:t", "w1:t1 --force", "w1:t1;echo", "w1:t1:t2", "w1:t" + "a" * 33]:
+                expect_error(close(target), "ID")
+            for session in ["", "../bad", "ssh:host", "work --remote=host", "a" * 65]:
+                expect_error(close(session=session), "session")
+            assert state().get("calls", []) == []
+            expect_error(close(session="work.test"), "explicit default local session")
+            assert state()["calls"] == [["--session=work.test", "tab", "get", "w1:t2"]]
+            reset()
+            expect_error(close("w1:t99"), "tab not found")
+            assert len(state()["calls"]) == 1
+            reset()
+            expect_error(close("w2:t1"), "last-tab")
+            assert len(state()["calls"]) == 2 and state()["snapshot"] == snapshot
+            for fields, text, removed in [
+                ({"close_failure": True}, "native close denied", False),
+                ({"close_error": {"code": "confirmation_required", "message": "human input required"}}, "confirmation_required", False),
+                ({"close_response": {"result": {"type": "tab_closed"}}}, "invalid close acknowledgement", True),
+            ]:
+                reset(**fields)
+                result = close()
+                expect_error(result, text)
+                assert "inspect before retrying" in result["structuredContent"]["error"]
+                assert len(state()["calls"]) == 3
+                assert (not any(t["tab_id"] == "w1:t2" for t in state()["snapshot"]["tabs"])) == removed
+                if not removed:
+                    assert state()["snapshot"] == snapshot
+
+            for operation, calls in [("tab_get", 1), ("workspace_get", 2), ("tab_close", 3)]:
+                with socket.socket(socket.AF_UNIX) as listener:
+                    listener.settimeout(3)
+                    listener.bind(str(root / f"{operation}.sock"))
+                    listener.listen(1)
+                    reset(dispatch_gate={"command": operation, "socket": f"{operation}.sock"})
+                    client.counter += 1
+                    request_id = client.counter
+                    client.send({"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {
+                        "name": "tab_close", "arguments": {"session": "default", "tab_id": "w1:t2"},
+                    }})
+                    connection, _ = listener.accept()
+                    with connection:
+                        connection.settimeout(2)
+                        assert connection.recv(1) == b"x"
+                        before_cancel = state()
+                        client.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": request_id}})
+                        assert client.call("ping", {}, timeout=2) == {}
+                        # Gated-child EOF proves the future was dropped, not just an early snapshot.
+                        assert connection.recv(1) == b""
+                    assert state() == before_cancel and len(state()["calls"]) == calls
+                    if operation != "tab_close":
+                        assert state()["snapshot"] == snapshot
+                    else:
+                        assert not any(t["tab_id"] == "w1:t2" for t in state()["snapshot"]["tabs"])
+        finally:
+            client.close()
+
+
 def main():
     binary = str(Path(sys.argv[1]).resolve())
     with tempfile.TemporaryDirectory(prefix="heeler-smoke-") as directory:
@@ -201,7 +321,7 @@ def main():
                 "caller_context", "session_list", "session_snapshot", "workstream_list",
                 "workstream_save", "workstream_overview", "location_open", "agent_inspect",
                 "agent_start", "assignment_send", "agent_read", "agent_wait", "agent_focus",
-                "workspace_rename", "tab_rename",
+                "workspace_rename", "tab_rename", "tab_close",
             }
             assert tools["session_snapshot"]["annotations"]["readOnlyHint"]
             check_renames(client, root, tools)
@@ -231,7 +351,8 @@ def main():
         finally:
             client.close()
         check_lock_contention(binary, root)
-    print("stdio smoke: discovery, renames/validation/native failures, snapshots, notes/conflicts, overview, restart, lock contention, and shutdown passed")
+    check_tab_close(binary, tools["tab_close"])
+    print("stdio smoke: discovery, renames/validation/native failures, tab close/isolation/cancellation, snapshots, notes/conflicts, overview, restart, lock contention, and shutdown passed")
 
 
 if __name__ == "__main__":

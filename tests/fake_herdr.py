@@ -79,6 +79,67 @@ if args == ["api", "snapshot"]:
 snapshot = state["snapshot"]
 area = args[0] if args else None
 command = args[1] if len(args) > 1 else None
+if (area, command) in [("workspace", "get"), ("tab", "get")]:
+    assert area is not None
+    if len(args) != 3:
+        fail("Get requires exactly one native ID")
+    item = next((item for item in snapshot[area + "s"] if item[area + "_id"] == args[2]), None)
+    if item is None:
+        fail(f"{area} not found")
+    dispatch_gate(area + "_get")
+    if area == "workspace":
+        item = {**item, "tab_count": sum(t["workspace_id"] == args[2] for t in snapshot["tabs"]),
+                "pane_count": sum(p["workspace_id"] == args[2] for p in snapshot["panes"])}
+    reply(area + "_info", **{area: item})
+
+if (area, command) == ("tab", "close"):
+    if len(args) != 3:
+        fail("Close requires exactly one native tab ID")
+    tab_id = args[2]
+    tab = next((t for t in snapshot["tabs"] if t["tab_id"] == tab_id), None)
+    if tab is None:
+        fail("tab not found")
+    if state.pop("close_failure", False):
+        fail("native close denied")
+    error = state.pop("close_error", None)
+    if error is not None:
+        save()
+        print(json.dumps({"error": error}))
+        sys.exit(0)
+    workspace_id = tab["workspace_id"]
+    workspace = next(w for w in snapshot["workspaces"] if w["workspace_id"] == workspace_id)
+    removed_panes = {p["pane_id"] for p in snapshot["panes"] if p["tab_id"] == tab_id}
+    snapshot["tabs"] = [t for t in snapshot["tabs"] if t["tab_id"] != tab_id]
+    snapshot["panes"] = [p for p in snapshot["panes"] if p["pane_id"] not in removed_panes]
+    snapshot["agents"] = [a for a in snapshot["agents"] if a["pane_id"] not in removed_panes]
+    snapshot["layouts"] = [layout for layout in snapshot["layouts"] if layout["tab_id"] != tab_id]
+    remaining = [t for t in snapshot["tabs"] if t["workspace_id"] == workspace_id]
+    if remaining:
+        workspace["tab_count"] = len(remaining)
+        workspace["pane_count"] = sum(p["workspace_id"] == workspace_id for p in snapshot["panes"])
+        if workspace["active_tab_id"] == tab_id:
+            workspace["active_tab_id"] = remaining[0]["tab_id"]
+    else:
+        # Native last-tab close removes its workspace. Heeler must preflight/refuse it.
+        snapshot["workspaces"] = [w for w in snapshot["workspaces"] if w["workspace_id"] != workspace_id]
+    if snapshot["focused_tab_id"] == tab_id:
+        next_tab = remaining[0] if remaining else next(iter(snapshot["tabs"]), None)
+        snapshot["focused_tab_id"] = next_tab["tab_id"] if next_tab else None
+        snapshot["focused_workspace_id"] = next_tab["workspace_id"] if next_tab else None
+        next_pane = next((p for p in snapshot["panes"] if next_tab and p["tab_id"] == next_tab["tab_id"]), None)
+        snapshot["focused_pane_id"] = next_pane["pane_id"] if next_pane else None
+        for t in snapshot["tabs"]:
+            t["focused"] = t["tab_id"] == snapshot["focused_tab_id"]
+        for p in snapshot["panes"]:
+            p["focused"] = p["pane_id"] == snapshot["focused_pane_id"]
+    dispatch_gate("tab_close")
+    override = state.pop("close_response", None)
+    if override is not None:
+        save()
+        print(json.dumps(override))
+        sys.exit(0)
+    reply("ok")
+
 if (area, command) in [("workspace", "rename"), ("tab", "rename")]:
     assert area is not None
     if len(args) != 4:

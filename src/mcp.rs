@@ -67,6 +67,15 @@ pub struct RenameTabRequest {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct CloseTabRequest {
+    /// Exact local session name. Required; use "default" explicitly.
+    pub session: String,
+    /// Exact native tab ID, such as w1:t2. Never inferred from focus.
+    pub tab_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InspectRequest {
     pub session: String,
     pub pane_id: String,
@@ -262,6 +271,28 @@ impl Heeler {
     }
 
     #[tool(
+        description = "Irreversibly close exactly one explicit local tab, terminating its contents/agents. Before calling, inspect its contents and obtain deliberate human authorization for this exact session/tab. Refuses an observed last tab because native close would close its workspace. Preflights are not atomic: a concurrent topology change can still cause workspace closure; do not use during such changes. Focus may change. Cancellation cannot undo an issued close; errors may follow side effects. Inspect before retrying; never blindly retry or bypass native refusals.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn tab_close(
+        &self,
+        Parameters(request): Parameters<CloseTabRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        output(tokio::select! {
+            biased;
+            _ = context.ct.cancelled() => Err(anyhow::anyhow!(
+                "tab close cancelled; an issued native close may have taken effect; inspect before retrying"
+            )),
+            result = self.herdr.close_tab(&request.session, &request.tab_id) => result,
+        })
+    }
+
+    #[tool(
         description = "Inspect an existing agent by explicit local session and pane. Returns a target handle for later reads, waits, focus and assignment dispatch. Reinspect after restarts, moves or conversation changes.",
         annotations(read_only_hint = true)
     )]
@@ -397,6 +428,22 @@ impl ServerHandler for Heeler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_requests_require_exact_session_and_tab_without_extra_controls() {
+        let request = json!({"session": "default", "tab_id": "w1:t2"});
+        assert!(serde_json::from_value::<CloseTabRequest>(request.clone()).is_ok());
+        for field in ["session", "tab_id"] {
+            let mut missing = request.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<CloseTabRequest>(missing).is_err());
+        }
+        for field in ["force", "current", "workspace_id", "confirmed"] {
+            let mut extra = request.clone();
+            extra[field] = true.into();
+            assert!(serde_json::from_value::<CloseTabRequest>(extra).is_err());
+        }
+    }
 
     #[test]
     fn rename_requests_require_explicit_fields_and_reject_extras() {

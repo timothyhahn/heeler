@@ -11,6 +11,11 @@ focus, start an agent, read/wait, and focus it. Live management uses Heeler MCP;
 missing operations are flagged, not bypassed via CLI. There are no automatic
 retries, permission approvals, or background scheduling.
 
+`tab_close` irreversibly terminates one explicitly inspected, human-authorized
+tab. It refuses observed last tabs to avoid workspace closure, but a concurrent
+topology change can still make it a last tab. Focus may change; cancellation
+cannot undo an issued close.
+
 ## Try it
 
 ```sh

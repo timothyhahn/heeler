@@ -27,3 +27,12 @@ synthetic notes. It contains retired workspace hints, long/empty pane suffixes,
 and the old 128-byte workspace / 160-byte pane boundaries (including UTF-8).
 Reads must not rewrite it; later v2 saves must preserve its hints. These are
 remembered references, not valid targets for strict live native operations.
+
+Tab close uses `TabTarget { tab_id }` (`tab.close`) and returns only
+`result: {"type":"ok"}`, not a `tab_closed` metadata envelope. The CLI mapping is
+in pinned `src/cli/tab_bindings.rs`; success/error and last-tab behavior are in
+`src/app/api/tabs.rs::handle_tab_close`. Native last-tab close can close the
+workspace or refuse restoration/worktree-group closure. Heeler reads explicit
+`tab get` / `workspace get` metadata and refuses observed last tabs; this is not
+atomic against other clients changing topology. The strict fake exercises those
+preflights, native acknowledgements/refusals, focus effects and cancellation.

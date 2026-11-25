@@ -1,8 +1,10 @@
 mod agents;
+mod close;
 mod locations;
 mod renames;
 
 pub use agents::{AgentHandle, AgentTarget, ReadSource, StartAgent};
+pub use close::ClosedTab;
 pub use locations::{Direction, OpenLocation, OpenedLocation};
 pub use renames::{RenamedTab, RenamedWorkspace, TabInfo, WorkspaceInfo};
 
