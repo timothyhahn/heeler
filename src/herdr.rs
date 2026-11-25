@@ -1,3 +1,11 @@
+mod agents;
+mod locations;
+mod renames;
+
+pub use agents::{AgentHandle, AgentTarget, ReadSource, StartAgent};
+pub use locations::{Direction, OpenLocation, OpenedLocation};
+pub use renames::{RenamedTab, RenamedWorkspace, TabInfo, WorkspaceInfo};
+
 use crate::model::validate_session;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -47,9 +55,24 @@ pub struct Agent {
     pub agent: Option<String>,
     pub agent_status: String,
     #[serde(default)]
+    pub launch_pending: bool,
+    #[serde(default)]
+    pub interactive_ready: bool,
+    #[serde(default)]
     pub completion_seq: Option<u64>,
     #[serde(default)]
     pub agent_session: Option<serde_json::Value>,
+}
+
+impl Agent {
+    // Native Codex startup may be interactive before status detection settles.
+    pub fn ready_for_prompt(&self) -> bool {
+        !self.launch_pending
+            && (matches!(self.agent_status.as_str(), "idle" | "done")
+                || (self.agent.as_deref() == Some("codex")
+                    && self.agent_status == "unknown"
+                    && self.interactive_ready))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +92,7 @@ impl Herdr {
         Self { binary }
     }
 
-    async fn json(&self, args: &[String]) -> Result<serde_json::Value> {
+    async fn run(&self, args: &[String], timeout: Duration) -> Result<String> {
         let mut child = Command::new(&self.binary)
             .args(args)
             .stdin(Stdio::null())
@@ -90,7 +113,7 @@ impl Herdr {
             .take(MAX_OUTPUT + 1);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let (status, _, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        let (status, _, _) = tokio::time::timeout(timeout, async {
             tokio::try_join!(
                 child.wait(),
                 stdout.read_to_end(&mut out),
@@ -98,26 +121,50 @@ impl Herdr {
             )
         })
         .await
-        .context("herdr read timed out; session state is unavailable")??;
+        .context("herdr command timed out")??;
         ensure!(
             out.len() as u64 <= MAX_OUTPUT && err.len() as u64 <= MAX_OUTPUT,
             "herdr output exceeded limit"
         );
         if !status.success() {
             bail!(
-                "herdr read failed: {}",
+                "herdr command failed: {}",
                 String::from_utf8_lossy(&err)
                     .chars()
                     .take(2000)
                     .collect::<String>()
             );
         }
-        let value: serde_json::Value =
-            serde_json::from_slice(&out).context("herdr returned invalid JSON")?;
-        if let Some(error) = value.get("error") {
-            bail!("herdr API error: {error}");
+        String::from_utf8(out).context("herdr returned invalid UTF-8")
+    }
+
+    async fn json(&self, args: &[String]) -> Result<serde_json::Value> {
+        parse_json(&self.run(args, Duration::from_secs(5)).await?)
+    }
+
+    fn session_args(session: &str, args: Vec<String>) -> Result<Vec<String>> {
+        validate_session(session)?;
+        let mut routed = vec![format!("--session={session}")];
+        routed.extend(args);
+        Ok(routed)
+    }
+
+    async fn session_json(
+        &self,
+        session: &str,
+        args: Vec<String>,
+        timeout: Duration,
+        mutates: bool,
+    ) -> Result<serde_json::Value> {
+        let args = Self::session_args(session, args)?;
+        let result = async { parse_json(&self.run(&args, timeout).await?) }.await;
+        if mutates {
+            result.with_context(|| format!(
+                "herdr operation in session {session} may have taken effect; inspect before retrying"
+            ))
+        } else {
+            result
         }
-        Ok(value)
     }
 
     pub async fn sessions(&self) -> Result<Vec<Session>> {
@@ -163,8 +210,22 @@ pub fn caller_context() -> serde_json::Value {
 }
 
 #[derive(Deserialize)]
-struct SnapshotResponse {
-    result: SnapshotResult,
+struct Response<T> {
+    result: T,
+}
+
+fn parse_json(text: &str) -> Result<serde_json::Value> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).context("herdr returned invalid JSON")?;
+    if let Some(error) = value.get("error") {
+        bail!("herdr API error: {error}");
+    }
+    Ok(value)
+}
+
+fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T> {
+    let response: Response<T> = serde_json::from_value(value).context("invalid herdr response")?;
+    Ok(response.result)
 }
 
 #[derive(Deserialize)]
@@ -174,9 +235,8 @@ enum SnapshotResult {
 }
 
 fn decode_snapshot(value: serde_json::Value) -> Result<Snapshot> {
-    let response: SnapshotResponse =
-        serde_json::from_value(value).context("invalid herdr snapshot response")?;
-    let SnapshotResult::SessionSnapshot { snapshot } = response.result;
+    let SnapshotResult::SessionSnapshot { snapshot } =
+        decode(value).context("invalid herdr snapshot response")?;
     Ok(snapshot)
 }
 
@@ -191,6 +251,38 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         (dir, Herdr::new(path))
+    }
+
+    #[test]
+    fn readiness_accepts_only_settled_or_native_ready_codex_agents() {
+        for kind in ["pi", "codex", "claude"] {
+            for status in [
+                "idle",
+                "done",
+                "unknown",
+                "blocked",
+                "working",
+                "unsupported",
+            ] {
+                for ready in [false, true] {
+                    for pending in [false, true] {
+                        let agent: Agent = serde_json::from_value(serde_json::json!({
+                            "pane_id": "w1:p1", "terminal_id": "term_test", "agent": kind,
+                            "agent_status": status, "interactive_ready": ready, "launch_pending": pending,
+                        })).unwrap();
+                        let expected = !pending
+                            && (matches!(status, "idle" | "done")
+                                || (kind == "codex" && status == "unknown" && ready));
+                        assert_eq!(agent.ready_for_prompt(), expected, "{agent:?}");
+                    }
+                }
+            }
+        }
+        let legacy: Agent = serde_json::from_value(serde_json::json!({
+            "pane_id": "w1:p1", "terminal_id": "term_test", "agent": "codex", "agent_status": "unknown",
+        })).unwrap();
+        assert!(!legacy.interactive_ready && !legacy.launch_pending);
+        assert!(!legacy.ready_for_prompt());
     }
 
     #[tokio::test]
@@ -238,6 +330,142 @@ mod tests {
         );
         let (_dir, herdr) = fake("printf '%s' 'not-json'");
         assert!(herdr.sessions().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn renames_route_session_and_keep_labels_in_one_argument() {
+        let label = "Review & notes; $(not-a-command) \"quoted\"";
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/herdr-0.9.5-snapshot.json"))
+                .unwrap();
+        for area in ["workspace", "tab"] {
+            let mut metadata = fixture["result"]["snapshot"][format!("{area}s")][0].clone();
+            metadata["label"] = label.into();
+            let id = if area == "workspace" { "w1" } else { "w1:t1" };
+            let response = serde_json::json!({"result": {
+                "type": format!("{area}_info"), area: metadata,
+            }});
+            let script = format!(
+                "test \"$#\" = 5 && test \"$1\" = '--session=work.test' && test \"$2\" = '{area}' && test \"$3\" = rename && test \"$4\" = '{id}' && test \"$5\" = '{label}' || exit 9\nprintf '%s' '{response}'"
+            );
+            let (_dir, herdr) = fake(&script);
+            let result = if area == "workspace" {
+                serde_json::to_value(
+                    herdr
+                        .rename_workspace("work.test", id, label)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                serde_json::to_value(herdr.rename_tab("work.test", id, label).await.unwrap())
+            }
+            .unwrap();
+            assert_eq!(result["session"], "work.test");
+            assert_eq!(result[area], metadata);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_rename_inputs_never_launch_native_commands() {
+        let herdr = Herdr::new(PathBuf::from("/nonexistent/heeler-test-herdr"));
+        for (area, valid_id) in [("workspace", "w1"), ("tab", "w1:t1")] {
+            let rename = async |session: &str, id: &str, label: &str| {
+                if area == "workspace" {
+                    herdr.rename_workspace(session, id, label).await.map(|_| ())
+                } else {
+                    herdr.rename_tab(session, id, label).await.map(|_| ())
+                }
+            };
+            for id in [
+                "",
+                "--help",
+                "--focus=w1",
+                "w1;echo",
+                "w1:t1 --focus",
+                "../w1",
+            ] {
+                let error = rename("default", id, "Label").await.unwrap_err();
+                assert!(error.to_string().contains("ID"), "{error:#}");
+            }
+            let oversized = "a".repeat(257);
+            let multibyte = "é".repeat(129);
+            for label in [
+                "", "  ", "\n", "a\0b", "a\tb", "a\u{7f}b", "--help", "--", "-x", &oversized,
+                &multibyte,
+            ] {
+                let error = rename("default", valid_id, label).await.unwrap_err();
+                assert!(error.to_string().contains("label"), "{error:#}");
+            }
+            for session in ["", "../bad", "ssh:host", "default --remote=host"] {
+                let error = rename(session, valid_id, "Label").await.unwrap_err();
+                assert!(error.to_string().contains("session"), "{error:#}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_failures_are_uncertain_and_never_retried() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/herdr-0.9.5-snapshot.json"))
+                .unwrap();
+        for area in ["workspace", "tab"] {
+            let mut metadata = fixture["result"]["snapshot"][format!("{area}s")][0].clone();
+            metadata["label"] = "Label".into();
+            let response = serde_json::json!({"result": {
+                "type": format!("{area}_info"), area: metadata,
+            }});
+            let mut wrong_id = response.clone();
+            wrong_id["result"][area][format!("{area}_id")] = "w9".into();
+            let mut wrong_label = response.clone();
+            wrong_label["result"][area]["label"] = "Other".into();
+            let mut incomplete = response.clone();
+            incomplete["result"][area]
+                .as_object_mut()
+                .unwrap()
+                .remove("number");
+            let mut wrong_kind = response.clone();
+            wrong_kind["result"]["type"] = "session_snapshot".into();
+            let mut wrong_workspace = response.clone();
+            if area == "tab" {
+                wrong_workspace["result"]["tab"]["workspace_id"] = "w9".into();
+            } else {
+                wrong_workspace["result"]["workspace"] = serde_json::Value::Null;
+            }
+            let responses = [
+                "printf '%s' 'native rename denied' >&2; exit 1".into(),
+                "printf '%s' '{\"error\":\"native API denied\"}'".into(),
+                "printf '%s' 'not-json'".into(),
+                format!("printf '%s' '{}'", response["result"][area]),
+                format!("printf '%s' '{wrong_kind}'"),
+                format!("printf '%s' '{incomplete}'"),
+                format!("printf '%s' '{wrong_id}'"),
+                format!("printf '%s' '{wrong_label}'"),
+                format!("printf '%s' '{wrong_workspace}'"),
+            ];
+            for (index, script) in responses.iter().enumerate() {
+                let (dir, herdr) = fake(&format!("printf x >> \"$0.calls\"\n{script}"));
+                let error = if area == "workspace" {
+                    herdr
+                        .rename_workspace("default", "w1", "Label")
+                        .await
+                        .map(|_| ())
+                } else {
+                    herdr
+                        .rename_tab("default", "w1:t1", "Label")
+                        .await
+                        .map(|_| ())
+                }
+                .unwrap_err();
+                let message = format!("{error:#}");
+                assert!(message.contains("inspect"), "{message}");
+                if index == 0 {
+                    assert!(message.contains("native rename denied"), "{message}");
+                } else if index == 1 {
+                    assert!(message.contains("native API denied"), "{message}");
+                }
+                assert_eq!(std::fs::read(dir.path().join("herdr.calls")).unwrap(), b"x");
+            }
+        }
     }
 
     #[tokio::test]

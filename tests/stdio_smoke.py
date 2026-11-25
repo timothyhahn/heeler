@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end stdio MCP check using only temporary state and a fake herdr."""
+import copy
 import json
 import os
 from pathlib import Path
@@ -124,6 +125,65 @@ def check_lock_contention(binary, root):
         client.close()
 
 
+def check_renames(client, root, tools):
+    state_path = root / "native.json"
+    for area, native_id in [("workspace", "w1"), ("tab", "w1:t1")]:
+        name = area + "_rename"
+        schema = tools[name]["inputSchema"]
+        assert set(schema["required"]) == {"session", area + "_id", "label"}
+        assert schema["additionalProperties"] is False
+        annotations = tools[name]["annotations"]
+        assert annotations["readOnlyHint"] is False
+        assert annotations["destructiveHint"] is False
+        assert annotations["idempotentHint"] is True
+        arguments = {"session": "default", area + "_id": native_id, "label": "Lead"}
+        before = json.loads(state_path.read_text())
+        for label in ["Lead & notes; $(not-a-command) 'quoted' \\", "é" * 128, "a" * 256]:
+            arguments["label"] = label
+            result = structured(client.tool(name, arguments))
+            expected = copy.deepcopy(before["snapshot"])
+            expected[area + "s"][0]["label"] = label
+            after = json.loads(state_path.read_text())
+            assert after["snapshot"] == expected, "rename must change only the specified label, not focus"
+            assert after["calls"] == before.get("calls", []) + [
+                ["--session=default", area, "rename", native_id, label]]
+            assert result == {"session": "default", area: expected[area + "s"][0]}
+            before = after
+
+        def expect_error(changes, message, native_calls=0):
+            request = {**arguments, **changes}
+            prior = json.loads(state_path.read_text())
+            result = client.tool(name, request)
+            assert result.get("isError"), result
+            assert message in result["structuredContent"]["error"], result
+            after = json.loads(state_path.read_text())
+            assert after["snapshot"] == prior["snapshot"]
+            assert len(after["calls"]) == len(prior["calls"]) + native_calls, "never retry a rename"
+            if native_calls:
+                assert after["calls"][-1] == [
+                    "--session=" + request["session"], area, "rename", request[area + "_id"], request["label"]]
+
+        for label in ["", "  ", "a\n", "a\r", "a\t", "a\0b", "a\x7fb", "a" * 257, "é" * 129,
+                      "--help", "--focus=w1", "--", "-x"]:
+            expect_error({"label": label}, "label")
+        for native_id in ["", "--help", "../w1", "w1 --focus", "w1:t1;t2", "w" + "a" * 128]:
+            expect_error({area + "_id": native_id}, "ID")
+        if area == "tab":
+            for native_id in ["w1", "w1:p1", "w1:t", "w1:t1:t2", "w1:t" + "a" * 33]:
+                expect_error({"tab_id": native_id}, "ID")
+        for session in ["", "../bad", "ssh:host", "default --remote=host"]:
+            expect_error({"session": session}, "session")
+        expect_error({"session": "work.test"}, "explicit default local session", native_calls=1)
+        missing_id = "w99" if area == "workspace" else "w99:t1"
+        expect_error({area + "_id": missing_id}, "not found", native_calls=1)
+        for flag, message in [("fail_rename", "native rename denied"),
+                              ("rename_api_error", "native rename API denied")]:
+            state = json.loads(state_path.read_text())
+            state[flag] = True
+            state_path.write_text(json.dumps(state))
+            expect_error({}, message, native_calls=1)
+
+
 def main():
     binary = str(Path(sys.argv[1]).resolve())
     with tempfile.TemporaryDirectory(prefix="heeler-smoke-") as directory:
@@ -131,23 +191,20 @@ def main():
         fake = root / "herdr"
         fixture = Path(__file__).parent / "fixtures" / "herdr-0.9.5-snapshot.json"
         response = json.loads(fixture.read_text())
-        fake.write_text(
-            f"#!{sys.executable}\nimport json, sys\n"
-            f"response = {response!r}\n"
-            "args = sys.argv[1:]\n"
-            "if args == ['session', 'list', '--json']:\n"
-            "    print(json.dumps({'sessions': [{'name': 'default', 'default': True, 'running': True}]}))\n"
-            "elif args == ['--session=default', 'api', 'snapshot']:\n"
-            "    print(json.dumps(response))\n"
-            "else:\n"
-            "    print('No such local session', file=sys.stderr); sys.exit(1)\n"
-        )
+        (root / "native.json").write_text(json.dumps({"snapshot": response["result"]["snapshot"]}))
+        fake.write_text(f"#!{sys.executable}\n" + (Path(__file__).parent / "fake_herdr.py").read_text())
         fake.chmod(0o700)
         client = Client(binary, root)
         try:
             tools = {tool["name"]: tool for tool in client.call("tools/list", {})["tools"]}
-            assert set(tools) == {"caller_context", "session_list", "session_snapshot", "workstream_list", "workstream_save", "workstream_overview"}
+            assert set(tools) == {
+                "caller_context", "session_list", "session_snapshot", "workstream_list",
+                "workstream_save", "workstream_overview", "location_open", "agent_inspect",
+                "agent_start", "assignment_send", "agent_read", "agent_wait", "agent_focus",
+                "workspace_rename", "tab_rename",
+            }
             assert tools["session_snapshot"]["annotations"]["readOnlyHint"]
+            check_renames(client, root, tools)
             assert structured(client.tool("caller_context"))["launch_context"]["HERDR_PANE_ID"] == "w9:p1"
             assert structured(client.tool("session_list"))["sessions"][0]["running"]
             inventory = structured(client.tool("session_snapshot", {"session": "default"}))
@@ -174,7 +231,7 @@ def main():
         finally:
             client.close()
         check_lock_contention(binary, root)
-    print("stdio smoke: discovery, snapshots, notes/conflicts, overview, restart, lock contention, and shutdown passed")
+    print("stdio smoke: discovery, renames/validation/native failures, snapshots, notes/conflicts, overview, restart, lock contention, and shutdown passed")
 
 
 if __name__ == "__main__":

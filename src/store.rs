@@ -4,7 +4,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -29,16 +29,7 @@ impl Store {
     }
 
     fn lock(&self) -> Result<File> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&self.root)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(&self.root)?;
+        create_state_dir(&self.root)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
@@ -82,7 +73,7 @@ impl Store {
         let document: Document = serde_json::from_slice(&bytes)
             .context("invalid workstream store; original left untouched")?;
         ensure!(
-            document.version == 1,
+            matches!(document.version, 1 | 2),
             "unsupported workstream store version {}",
             document.version
         );
@@ -128,7 +119,7 @@ impl Store {
         ensure!(records.len() <= 256, "workstream limit reached");
         records.sort_by(|a, b| a.workstream.id.cmp(&b.workstream.id));
         let bytes = serde_json::to_vec_pretty(&Document {
-            version: 1,
+            version: 2,
             records,
         })?;
         ensure!(
@@ -139,8 +130,48 @@ impl Store {
         temporary.write_all(&bytes)?;
         temporary.as_file().sync_all()?;
         temporary.persist(self.root.join("workstreams.json"))?;
+        sync_directory(&self.root)
+            .context("notes were replaced but directory sync failed; reread before retrying")?;
         Ok(record)
     }
+}
+
+fn create_state_dir(path: &Path) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            ensure!(metadata.is_dir(), "state path is not a directory");
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    create_state_dir(parent)?;
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Persist each new directory's name, including nested state-dir ancestors.
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path; // Directory flushing needs a platform-specific implementation.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -157,6 +188,7 @@ mod tests {
             next_action: None,
             blocker: None,
             locations: vec![],
+            assignments: vec![],
         }
     }
 
@@ -178,10 +210,83 @@ mod tests {
     }
 
     #[test]
+    fn saves_in_new_nested_state_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("nested").join("notes"));
+        store.save(sample(), 0).unwrap();
+        assert_eq!(store.list().unwrap()[0].revision, 1);
+    }
+
+    #[test]
+    fn upgrades_version_one_only_when_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        let old = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "records": [{"revision": 1, "updated_at_unix": 1, "workstream": sample()}]
+        }))
+        .unwrap();
+        let path = dir.path().join("workstreams.json");
+        fs::write(&path, &old).unwrap();
+        let records = store.list().unwrap();
+        assert!(records[0].workstream.assignments.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), old);
+        let mut changed = records[0].workstream.clone();
+        changed.next_action = Some("Draft notes".into());
+        store.save(changed, 1).unwrap();
+        let upgraded: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(upgraded["version"], 2);
+        assert_eq!(upgraded["records"][0]["revision"], 2);
+        assert_eq!(
+            upgraded["records"][0]["workstream"]["next_action"],
+            "Draft notes"
+        );
+    }
+
+    #[test]
+    fn head_accepted_location_hints_survive_reads_and_version_two_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        let original = include_bytes!("../tests/fixtures/heeler-v1-location-hints.json");
+        let path = dir.path().join("workstreams.json");
+        fs::write(&path, original).unwrap();
+        let records = store.list().unwrap();
+        let legacy = &records[0];
+        assert_eq!(legacy.workstream.locations.len(), 6);
+        assert!(legacy.workstream.assignments.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        // An unrelated update upgrades the envelope, not the remembered hints.
+        store.save(sample(), 0).unwrap();
+        let upgraded: Document = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded.version, 2);
+        let preserved = upgraded
+            .records
+            .iter()
+            .find(|r| r.workstream.id == "legacy")
+            .unwrap();
+        assert_eq!(preserved.revision, legacy.revision);
+        assert_eq!(preserved.updated_at_unix, legacy.updated_at_unix);
+        assert_eq!(preserved.workstream, legacy.workstream);
+
+        let mut changed = legacy.workstream.clone();
+        changed.next_action = Some("Reconcile the retired hints".into());
+        store.save(changed.clone(), legacy.revision).unwrap();
+        let records = store.list().unwrap();
+        let saved = records
+            .iter()
+            .find(|r| r.workstream.id == "legacy")
+            .unwrap();
+        assert_eq!(saved.revision, legacy.revision + 1);
+        assert_eq!(saved.workstream, changed);
+        assert_eq!(saved.workstream.locations, legacy.workstream.locations);
+    }
+
+    #[test]
     fn refuses_to_overwrite_corrupt_or_future_data() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().to_owned());
-        for bytes in [b"not json".as_slice(), br#"{"version":2,"records":[]}"#] {
+        for bytes in [b"not json".as_slice(), br#"{"version":3,"records":[]}"#] {
             fs::write(dir.path().join("workstreams.json"), bytes).unwrap();
             assert!(store.save(sample(), 0).is_err());
             assert_eq!(

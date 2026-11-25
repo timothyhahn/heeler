@@ -33,7 +33,9 @@ the project is small; don't turn it into an architecture pitch.
 
 - `src/model.rs`: durable workstream intent and native location references.
 - `src/store.rs`: versioned JSON records, locking, and atomic replacement.
-- `src/herdr.rs`: bounded local CLI reads; no shell interpolation or remote routing.
+- `src/herdr.rs` and `src/herdr/`: bounded, explicit local CLI operations; no shell
+  interpolation or remote routing.
+- `src/assignment.rs`: handoff briefs and recorded submission attempts, not a job engine.
 - `src/overview.rs`: factual reconciliation, not autonomous prioritization.
 - `src/mcp.rs`: stdio tool adapter over the core.
 - `roles/lead/AGENTS.md`: harness-independent lead behavior.
@@ -42,16 +44,28 @@ the project is small; don't turn it into an architecture pitch.
 
 - Herdr 0.9.5 snapshot responses contain `result.type = session_snapshot` and
   `result.snapshot`. Keep `tests/fixtures/` faithful to upstream, not the parser.
+- Native leaves use `--flag value` and put agent targets first. Legacy parsers
+  reject `--flag=value` and bare `--` on get/prompt/read/wait/focus. Only agent
+  start uses `--` to separate the launched agent's own arguments.
 - Workstream saves replace a complete record and require its latest revision
   (`0` for create-only). Never reset corrupt or unsupported state implicitly.
-- Atomic replacement prevents partial JSON; power-loss durability is not yet guaranteed.
+- Readers accept state versions 1 and 2; saves write version 2. Old workstreams
+  acquire empty assignment lists without modifying their files until a save.
+- Dispatch records an uncertain attempt before sending. Submission acknowledgement
+  isn't completion. A failed final note update must not turn an acknowledged send
+  into an error that invites an automatic retry.
+- Unix saves sync file contents and the replacement directory; new state directories
+  sync their parents too. Other platforms currently provide atomic replacement only.
+  A directory-sync failure may occur after replacement: reread before retrying.
 - Store lock acquisition retries for up to one second before returning busy;
-  CLI reads have a five-second timeout. Neither is unattended monitoring.
+  ordinary CLI reads have a five-second timeout. Native launch/wait calls are
+  explicitly bounded, with transport overhead. Neither is unattended monitoring.
 - Overview observations are typed and must not modify remembered workstream intent.
 
 ## Verification
 
 Run `cargo fmt --check`, `cargo test --locked`, and
 `cargo clippy --locked --all-targets -- -D warnings`.
-Run `python3 tests/stdio_smoke.py target/debug/heeler` after `cargo build --locked`.
+After `cargo build --locked`, run `python3 tests/stdio_smoke.py target/debug/heeler`
+and `python3 tests/delegation_smoke.py target/debug/heeler`.
 Keep `Cargo.lock` checked in. Never log diagnostic prose to MCP stdout.

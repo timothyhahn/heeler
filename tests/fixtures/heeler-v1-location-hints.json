@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "records": [
+    {
+      "revision": 1,
+      "updated_at_unix": 1795628550,
+      "workstream": {
+        "id": "legacy",
+        "title": "Legacy location hints",
+        "purpose": "Synthetic compatibility regression",
+        "status": "planned",
+        "next_action": null,
+        "blocker": null,
+        "locations": [
+          {
+            "session": "default",
+            "workspace_id": "retired-workspace",
+            "pane_id": null
+          },
+          {
+            "session": "default",
+            "workspace_id": "w1",
+            "pane_id": "w1:paaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "session": "default",
+            "workspace_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "pane_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr:paaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "session": "default",
+            "workspace_id": "w1",
+            "pane_id": "w1:paaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "session": "default",
+            "workspace_id": "w1",
+            "pane_id": "w1:p"
+          },
+          {
+            "session": "default",
+            "workspace_id": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+            "pane_id": null
+          }
+        ]
+      }
+    }
+  ]
+}

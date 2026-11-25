@@ -1,4 +1,5 @@
-use anyhow::{Result, ensure};
+use crate::assignment::Assignment;
+use anyhow::{Context, Result, ensure};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -33,19 +34,13 @@ pub struct Workstream {
     pub blocker: Option<String>,
     #[serde(default)]
     pub locations: Vec<Location>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignments: Vec<Assignment>,
 }
 
 impl Workstream {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.id.is_empty()
-                && self.id.len() <= 64
-                && self
-                    .id
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
-            "id must contain 1–64 lowercase ASCII letters, digits, or hyphens"
-        );
+        validate_id(&self.id)?;
         ensure!(
             !self.title.trim().is_empty() && self.title.len() <= 256,
             "title must contain 1–256 bytes"
@@ -57,6 +52,8 @@ impl Workstream {
         ensure!(self.locations.len() <= 32, "too many linked locations");
         for location in &self.locations {
             validate_session(&location.session)?;
+            // Remembered hints keep the v1 contract, including retired identifiers.
+            // Live native inputs and assignment targets use the strict validators below.
             ensure!(
                 !location.workspace_id.is_empty() && location.workspace_id.len() <= 128,
                 "invalid workspace ID"
@@ -68,8 +65,65 @@ impl Workstream {
                 );
             }
         }
+        ensure!(
+            self.assignments.len() <= 16,
+            "too many assignments in one workstream"
+        );
+        let mut ids = std::collections::HashSet::new();
+        for assignment in &self.assignments {
+            assignment.validate()?;
+            ensure!(ids.insert(&assignment.id), "duplicate assignment ID");
+        }
         Ok(())
     }
+}
+
+pub(crate) fn validate_id(id: &str) -> Result<()> {
+    ensure!(
+        !id.is_empty()
+            && id.len() <= 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        "id must contain 1–64 lowercase ASCII letters, digits, or hyphens"
+    );
+    Ok(())
+}
+
+pub fn validate_workspace_id(id: &str) -> Result<()> {
+    ensure!(
+        id.len() <= 128
+            && id
+                .strip_prefix('w')
+                .is_some_and(|number| !number.is_empty()
+                    && number.bytes().all(|b| b.is_ascii_alphanumeric())),
+        "invalid workspace ID"
+    );
+    Ok(())
+}
+
+pub fn validate_tab_id(id: &str) -> Result<()> {
+    let (workspace, number) = id.split_once(":t").context("invalid tab ID")?;
+    validate_workspace_id(workspace)?;
+    ensure!(
+        !number.is_empty()
+            && number.len() <= 32
+            && number.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "invalid tab ID"
+    );
+    Ok(())
+}
+
+pub fn validate_pane_id(id: &str) -> Result<()> {
+    let (workspace, number) = id.split_once(":p").context("invalid pane ID")?;
+    validate_workspace_id(workspace)?;
+    ensure!(
+        !number.is_empty()
+            && number.len() <= 32
+            && number.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "invalid pane ID"
+    );
+    Ok(())
 }
 
 pub fn validate_session(name: &str) -> Result<()> {
@@ -107,6 +161,7 @@ mod tests {
             next_action: None,
             blocker: None,
             locations: vec![],
+            assignments: vec![],
         }
     }
 
@@ -119,6 +174,50 @@ mod tests {
             assert!(validate_session(name).is_err());
         }
         assert!(validate_session("Work_2").is_ok());
+    }
+
+    #[test]
+    fn validates_native_tab_ids() {
+        for id in ["w1:t1", "wABC:t2", "w2:tXYZ"] {
+            assert!(validate_tab_id(id).is_ok(), "{id}");
+        }
+        for id in [
+            "",
+            "--help",
+            "w1",
+            "w1:p1",
+            "w1:t",
+            "w1:t1:t2",
+            "w1:t../x",
+            "w1:t1 --focus",
+        ] {
+            assert!(validate_tab_id(id).is_err(), "{id}");
+        }
+        assert!(validate_tab_id(&format!("w1:t{}", "a".repeat(33))).is_err());
+        assert!(validate_tab_id(&format!("w{}:t1", "a".repeat(128))).is_err());
+    }
+
+    #[test]
+    fn remembered_hints_keep_legacy_bounds_without_loosening_live_ids() {
+        let mut work = sample("legacy");
+        work.locations.push(Location {
+            session: "default".into(),
+            workspace_id: "retired-workspace".into(),
+            pane_id: None,
+        });
+        assert!(work.validate().is_ok());
+        assert!(validate_workspace_id(&work.locations[0].workspace_id).is_err());
+        work.locations[0].workspace_id = "w1".into();
+        work.locations[0].pane_id = Some(format!("w1:p{}", "a".repeat(156)));
+        assert!(work.validate().is_ok());
+        assert!(validate_pane_id(work.locations[0].pane_id.as_ref().unwrap()).is_err());
+        work.locations[0].pane_id.as_mut().unwrap().push('a');
+        assert!(work.validate().is_err());
+        work.locations[0].pane_id = None;
+        for workspace in [String::new(), "a".repeat(129), "é".repeat(65)] {
+            work.locations[0].workspace_id = workspace;
+            assert!(work.validate().is_err());
+        }
     }
 
     #[test]

@@ -153,6 +153,7 @@ mod tests {
                 status: Status::Planned,
                 next_action: None,
                 blocker: None,
+                assignments: vec![],
                 locations: vec![Location {
                     session: session.into(),
                     workspace_id: "w1".into(),

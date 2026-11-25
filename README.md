@@ -4,8 +4,12 @@ A small Rust management layer for [herdr](https://github.com/herdrdev/herdr).
 Your coding agent acts as lead, using MCP tools to keep track of what you've
 started, where it lives, and what needs attention.
 
-Still early. It can keep workstream notes, inspect local sessions, and compare
-the two. It can't open, focus, prompt, or close panes yet.
+Still early. It keeps workstream notes, inspects local sessions, and hands saved
+implementation or review assignments to agents in explicit panes. The lead can
+reuse agents or open a location, rename workspace/tab labels without changing
+focus, start an agent, read/wait, and focus it. Live management uses Heeler MCP;
+missing operations are flagged, not bypassed via CLI. There are no automatic
+retries, permission approvals, or background scheduling.
 
 ## Try it
 
@@ -32,9 +36,12 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked
 python3 tests/stdio_smoke.py target/debug/heeler
+python3 tests/delegation_smoke.py target/debug/heeler
 ```
 
 The fixtures target herdr 0.9.5. Checks use temporary state and fake executables,
-not live panes. The stdio smoke test currently requires macOS or Linux.
+not live panes. The smoke tests require macOS or Linux. The next live trial is a
+small implementation/review handoff inside herdr, with explicit permission to
+create the test panes; the fixture loop isn't proof of live integration.
 
 [MIT licensed](LICENSE).
