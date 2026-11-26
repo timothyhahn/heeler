@@ -1,4 +1,5 @@
 use crate::herdr::{Agent, Snapshot};
+use crate::memory::RecordSummary;
 use crate::model::{Location, Record};
 use serde::Serialize;
 
@@ -17,6 +18,46 @@ pub struct WorkstreamReport {
     pub locations: Vec<LocationReport>,
     pub unlinked: bool,
     pub recorded_blocker: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompactOverview {
+    pub compact: bool,
+    pub inspected_session: String,
+    pub session_error: Option<String>,
+    pub workstreams: Vec<CompactWorkstreamReport>,
+    pub live_inventory: Option<Snapshot>,
+    pub interpretation: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompactWorkstreamReport {
+    pub summary: RecordSummary,
+    pub locations: Vec<LocationReport>,
+    pub unlinked: bool,
+    pub recorded_blocker: Option<String>,
+}
+
+impl Overview {
+    pub fn compact(self) -> CompactOverview {
+        CompactOverview {
+            compact: true,
+            inspected_session: self.inspected_session,
+            session_error: self.session_error,
+            workstreams: self
+                .workstreams
+                .into_iter()
+                .map(|report| CompactWorkstreamReport {
+                    summary: RecordSummary::from(&report.record),
+                    locations: report.locations,
+                    unlinked: report.unlinked,
+                    recorded_blocker: report.recorded_blocker,
+                })
+                .collect(),
+            live_inventory: self.live_inventory,
+            interpretation: self.interpretation,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -280,6 +321,60 @@ mod tests {
             result.workstreams[0].locations[0].observation,
             Observation::PanePresent { agent: None, .. }
         ));
+    }
+
+    #[test]
+    fn preserves_named_tab_observations_without_rewriting_remembered_intent() {
+        let mut snapshot = inventory();
+        snapshot.tabs[0].label = Some("impl → inventory".into());
+        snapshot.tabs[0].agent_status = "done".into();
+        snapshot.agents[0].agent_status = "done".into();
+        let tabs = serde_json::to_value(&snapshot.tabs).unwrap();
+        let work = record("default", Some("w1:p1"));
+        let remembered = serde_json::to_value(&work).unwrap();
+        let result = reconcile(vec![work], "default".into(), Ok(snapshot));
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["live_inventory"]["tabs"], tabs);
+        assert_eq!(value["workstreams"][0]["record"], remembered);
+        assert_eq!(
+            value["workstreams"][0]["locations"][0]["agent"]["agent_status"],
+            "done"
+        );
+        assert_eq!(
+            value["workstreams"][0]["record"]["workstream"]["status"],
+            "planned"
+        );
+    }
+
+    #[test]
+    fn compact_projection_preserves_inventory_observations_and_errors() {
+        for snapshot in [Ok(inventory()), Err("native snapshot unavailable".into())] {
+            let full = reconcile(
+                vec![record("default", Some("w1:p1"))],
+                "default".into(),
+                snapshot,
+            );
+            let expected = serde_json::to_value(&full).unwrap();
+            let compact = serde_json::to_value(full.compact()).unwrap();
+            assert_eq!(compact["compact"], true);
+            for field in [
+                "inspected_session",
+                "session_error",
+                "live_inventory",
+                "interpretation",
+            ] {
+                assert_eq!(compact[field], expected[field]);
+            }
+            for field in ["locations", "unlinked", "recorded_blocker"] {
+                assert_eq!(
+                    compact["workstreams"][0][field],
+                    expected["workstreams"][0][field]
+                );
+            }
+            assert!(compact["workstreams"][0].get("record").is_none());
+            assert_eq!(compact["workstreams"][0]["summary"]["status"], "planned");
+            assert_eq!(compact["workstreams"][0]["summary"]["revision"], 1);
+        }
     }
 
     #[test]

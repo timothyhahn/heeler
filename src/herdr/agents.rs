@@ -63,6 +63,16 @@ pub struct AgentHandle {
     pub agent: Agent,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PromptAcknowledgement {
+    /// Supplied identity checked where known; None conversation remains unverified.
+    pub target: AgentTarget,
+    pub agent: Agent,
+    pub acknowledged: bool,
+    /// Native metadata can predate input; it is not a fresh final observation.
+    pub metadata_timing: &'static str,
+}
+
 impl AgentHandle {
     fn new(session: &str, agent: Agent) -> Result<Self> {
         let target = AgentTarget {
@@ -213,6 +223,41 @@ impl Herdr {
         AgentHandle::new(session, agent)
     }
 
+    /// One ordinary message to a settled worker, not a steering/queue/abort API.
+    pub async fn prompt_settled_agent(
+        &self,
+        target: &AgentTarget,
+        text: String,
+    ) -> Result<PromptAcknowledgement> {
+        // Native globals are consumed across argv before the leaf protects TEXT.
+        if let Some(option) = ["--session", "--remote", "--remote-keybindings"]
+            .into_iter()
+            .find(|option| {
+                text.strip_prefix(*option)
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('='))
+            })
+        {
+            bail!(
+                "text matches native herdr CLI global option {option}, which is consumed before prompt parsing; rephrase the message; no native calls were made"
+            );
+        }
+        ensure!(
+            !text.trim().is_empty()
+                && text.len() <= 32_768
+                && text
+                    .chars()
+                    .all(|c| !c.is_control() || matches!(c, '\n' | '\t')),
+            "text must be nonblank, at most 32768 UTF-8 bytes, without controls except LF and tab"
+        );
+        let handle = self.prompt_agent(target, text).await?;
+        Ok(PromptAcknowledgement {
+            target: target.clone(),
+            agent: handle.agent,
+            acknowledged: true,
+            metadata_timing: "pre_submission",
+        })
+    }
+
     /// Acknowledges terminal submission, not task completion. Never retries.
     pub(crate) async fn prompt_agent(
         &self,
@@ -228,26 +273,30 @@ impl Herdr {
             !text.trim().is_empty() && text.len() <= 32_768 && !text.contains('\0'),
             "invalid or oversized prompt"
         );
-        let value = self
-            .session_json(
-                &target.session,
-                vec![
-                    "agent".into(),
-                    "prompt".into(),
-                    target.pane_id.clone(),
-                    text,
-                ],
-                Duration::from_secs(10),
-                true,
-            )
-            .await?;
-        let AgentResult::Prompted { agent } = decode(value)
-            .context("invalid submission response; inspect the agent before retrying")?
-        else {
-            bail!("unexpected submission response; inspect the agent before retrying");
-        };
-        target.check(&agent)?;
-        AgentHandle::new(&target.session, agent)
+        async {
+            let value = self
+                .session_json(
+                    &target.session,
+                    vec![
+                        "agent".into(),
+                        "prompt".into(),
+                        target.pane_id.clone(),
+                        text,
+                    ],
+                    Duration::from_secs(10),
+                    true,
+                )
+                .await?;
+            let AgentResult::Prompted { agent } = decode(value)
+                .context("invalid submission response; inspect the agent before retrying")?
+            else {
+                bail!("unexpected submission response; inspect the agent before retrying");
+            };
+            target.check(&agent)?;
+            AgentHandle::new(&target.session, agent)
+        }
+        .await
+        .context("prompt possibly submitted; inspect before retrying; do not resend automatically")
     }
 
     pub async fn read_agent(
@@ -319,5 +368,113 @@ impl Herdr {
         };
         target.check(&agent)?;
         AgentHandle::new(&target.session, agent)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn target() -> AgentTarget {
+        AgentTarget {
+            session: "work.test".into(),
+            pane_id: "w1:p1".into(),
+            terminal_id: "term_test".into(),
+            agent: "pi".into(),
+            agent_session: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn text_only_prompt_rejects_controls_and_byte_overflow_before_native_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let herdr = Herdr::new(dir.path().join("missing-herdr"));
+        for text in [
+            "".into(),
+            " \n\t".into(),
+            "bad\0text".into(),
+            "bad\rtext".into(),
+            "\u{1b}[A".into(),
+            "\u{3}".into(),
+            "\u{7f}".into(),
+            "\u{85}".into(),
+            "x".repeat(32769),
+            "é".repeat(16385),
+        ] {
+            let error = herdr
+                .prompt_settled_agent(&target(), text)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("UTF-8 bytes"), "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_native_global_text_is_rejected_before_metadata_without_uncertainty() {
+        let dir = tempfile::tempdir().unwrap();
+        let herdr = Herdr::new(dir.path().join("missing-herdr"));
+        for option in ["--session", "--remote", "--remote-keybindings"] {
+            for text in std::iter::once(option.to_string()).chain(
+                [
+                    "",
+                    "other",
+                    "../bad",
+                    "-bad",
+                    "local",
+                    "server",
+                    "invalid value",
+                    "x\ny",
+                ]
+                .map(|value| format!("{option}={value}")),
+            ) {
+                let error = herdr
+                    .prompt_settled_agent(&target(), text)
+                    .await
+                    .unwrap_err();
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("native herdr CLI global option") && message.contains(option)
+                );
+                assert!(message.contains("rephrase") && message.contains("no native calls"));
+                assert!(!message.contains("possibly submitted") && !message.contains("resend"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settled_prompt_routes_explicit_session_and_literal_text_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("herdr");
+        let response: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/herdr-0.9.5-snapshot.json"
+        ))
+        .unwrap();
+        let mut agent = response["result"]["snapshot"]["agents"][0].clone();
+        agent["agent_status"] = "idle".into();
+        let info = json!({"result": {"type": "agent_info", "agent": agent}});
+        let ack =
+            json!({"id": "cli:agent:prompt", "result": {"type": "agent_prompted", "agent": agent}});
+        let script = format!(
+            "#!/bin/sh\nprintf x >> \"$0.calls\"\ntest \"$1\" = '--session=work.test' && test \"$2\" = agent && test \"$4\" = 'w1:p1' || exit 9\ncase \"$3\" in\n get) test \"$#\" = 4 || exit 9; printf '%s' '{info}';;\n prompt) test \"$#\" = 5 && test \"$5\" = '--help' || exit 9; printf '%s' '{ack}';;\n *) exit 9;;\nesac\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let herdr = Herdr::new(path);
+        let expected = target();
+        let ack = herdr
+            .prompt_settled_agent(&expected, "--help".into())
+            .await
+            .unwrap();
+        assert_eq!(ack.target, expected);
+        assert!(ack.acknowledged);
+        assert_eq!(ack.metadata_timing, "pre_submission");
+        assert_eq!(ack.agent.agent_status, "idle");
+        assert!(serde_json::to_value(ack).unwrap().get("text").is_none());
+        assert_eq!(
+            std::fs::read(dir.path().join("herdr.calls")).unwrap(),
+            b"xx"
+        );
     }
 }

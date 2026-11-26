@@ -69,6 +69,7 @@ def start(client, pane_id, name, kind):
 
 
 def check_loop(client, root):
+    change_native(root, lambda state: state.update(expect_saved_assignment=True))
     opened = open_location(client, {
         "type": "workspace", "cwd": str(root / "project with spaces"), "label": "Feature",
     })
@@ -251,6 +252,7 @@ def check_cancellation(binary):
         fake.chmod(0o700)
         client = Client(binary, root)
         try:
+            change_native(root, lambda state: state.update(expect_saved_assignment=True))
             opened = open_location(client, {"type": "workspace", "cwd": str(root), "label": "Cancellation"})
             target = start(client, opened["pane"]["pane_id"], "worker", "pi")
             for name, command, skip, revision, delivery in [

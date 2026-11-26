@@ -1,11 +1,13 @@
 mod agents;
 mod close;
 mod locations;
+mod moves;
 mod renames;
 
-pub use agents::{AgentHandle, AgentTarget, ReadSource, StartAgent};
+pub use agents::{AgentHandle, AgentTarget, PromptAcknowledgement, ReadSource, StartAgent};
 pub use close::ClosedTab;
 pub use locations::{Direction, OpenLocation, OpenedLocation};
+pub use moves::{AgentMoveReceipt, MoveReason, NativeLocation};
 pub use renames::{RenamedTab, RenamedWorkspace, TabInfo, WorkspaceInfo};
 
 use crate::model::validate_session;
@@ -85,6 +87,7 @@ pub struct Snapshot {
     pub focused_tab_id: Option<String>,
     pub focused_pane_id: Option<String>,
     pub workspaces: Vec<Workspace>,
+    pub tabs: Vec<TabInfo>,
     pub panes: Vec<Pane>,
     pub agents: Vec<Agent>,
 }
@@ -296,6 +299,8 @@ mod tests {
         let (_dir, herdr) = fake(&script);
         let snapshot = herdr.snapshot("work.test").await.unwrap();
         assert_eq!(snapshot.protocol, 22);
+        assert_eq!(snapshot.tabs[0].tab_id, "w1:t1");
+        assert_eq!(snapshot.tabs[0].label.as_deref(), Some("Notes"));
         assert_eq!(snapshot.panes[0].terminal_id, "term_test");
         assert_eq!(snapshot.agents[0].agent_status, "blocked");
         assert!(herdr.snapshot("../bad").await.is_err());
@@ -317,6 +322,101 @@ mod tests {
             .unwrap()
             .remove("version");
         assert!(decode_snapshot(incomplete).is_err());
+    }
+
+    #[test]
+    fn snapshot_preserves_tab_metadata_without_inventing_missing_labels() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/herdr-0.9.5-snapshot.json"))
+                .unwrap();
+        let snapshot = decode_snapshot(fixture.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&snapshot.tabs).unwrap(),
+            fixture["result"]["snapshot"]["tabs"]
+        );
+        for label in [
+            serde_json::json!("impl → inventory"),
+            serde_json::json!(""),
+            serde_json::Value::Null,
+        ] {
+            let mut response = fixture.clone();
+            response["result"]["snapshot"]["tabs"][0]["label"] = label;
+            let snapshot = decode_snapshot(response.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(snapshot.tabs).unwrap(),
+                response["result"]["snapshot"]["tabs"]
+            );
+        }
+        let mut response = fixture;
+        response["result"]["snapshot"]["tabs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("label");
+        assert!(decode_snapshot(response).unwrap().tabs[0].label.is_none());
+    }
+
+    #[test]
+    fn snapshot_requires_native_tabs_and_rejects_malformed_entries() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/herdr-0.9.5-snapshot.json"))
+                .unwrap();
+        let mut missing = fixture.clone();
+        missing["result"]["snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tabs");
+        assert!(
+            decode_snapshot(missing)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid herdr snapshot response")
+        );
+        for tabs in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("tabs"),
+            serde_json::json!([null]),
+        ] {
+            let mut response = fixture.clone();
+            response["result"]["snapshot"]["tabs"] = tabs;
+            assert!(decode_snapshot(response).is_err());
+        }
+        for field in [
+            "tab_id",
+            "workspace_id",
+            "number",
+            "focused",
+            "pane_count",
+            "agent_status",
+        ] {
+            let mut response = fixture.clone();
+            response["result"]["snapshot"]["tabs"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(decode_snapshot(response).is_err(), "missing {field}");
+        }
+        for (field, value) in [
+            ("tab_id", serde_json::json!(1)),
+            ("workspace_id", serde_json::Value::Null),
+            ("number", serde_json::json!("1")),
+            ("focused", serde_json::json!("true")),
+            ("pane_count", serde_json::json!(-1)),
+            ("agent_status", serde_json::json!({})),
+            ("label", serde_json::json!(42)),
+        ] {
+            let mut response = fixture.clone();
+            response["result"]["snapshot"]["tabs"][0][field] = value;
+            assert!(decode_snapshot(response).is_err(), "malformed {field}");
+        }
+        let mut empty = fixture;
+        for collection in ["workspaces", "tabs", "panes", "agents", "layouts"] {
+            empty["result"]["snapshot"][collection] = serde_json::json!([]);
+        }
+        for focus in ["focused_workspace_id", "focused_tab_id", "focused_pane_id"] {
+            empty["result"]["snapshot"][focus] = serde_json::Value::Null;
+        }
+        assert!(decode_snapshot(empty).unwrap().tabs.is_empty());
     }
 
     #[tokio::test]

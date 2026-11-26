@@ -11,6 +11,11 @@ import sys
 import tempfile
 import time
 
+from memory_smoke import check_memory
+from move_smoke import check_moves
+from outcome_smoke import check_outcomes
+from prompt_smoke import check_prompts
+
 
 class Client:
     def __init__(self, binary, root):
@@ -185,6 +190,129 @@ def check_renames(client, root, tools):
             expect_error({}, message, native_calls=1)
 
 
+def check_named_inventory(client, root):
+    state_path = root / "native.json"
+    state = json.loads(state_path.read_text())
+    snapshot = state["snapshot"]
+    workspace_template = snapshot["workspaces"][0]
+    tab_template = snapshot["tabs"][0]
+    pane_template = snapshot["panes"][0]
+    agent_template = snapshot["agents"][0]
+    snapshot.update(workspaces=[], tabs=[], panes=[], agents=[])
+    pane_numbers = {"w1": 0, "w2": 0}
+    for workspace_id, number, label, status, count in [
+        ("w1", 1, "impl → inventory", "working", 1),
+        ("w1", 2, "Review", "idle", 2),
+        ("w1", 3, None, "blocked", 1),
+        ("w2", 1, "Review", "done", 1),
+        ("w2", 2, "検証 with spaces", "unknown", 1),
+        ("w2", 3, "", "idle", 1),
+    ]:
+        tab_id = f"{workspace_id}:t{number}"
+        focused = tab_id == "w1:t1"
+        snapshot["tabs"].append({**tab_template, "workspace_id": workspace_id, "tab_id": tab_id,
+                                 "number": number, "label": label, "focused": focused,
+                                 "pane_count": count, "agent_status": status})
+        for index in range(count):
+            pane_numbers[workspace_id] += 1
+            pane_id = f"{workspace_id}:p{pane_numbers[workspace_id]}"
+            terminal_id = f"term_{workspace_id}_{number}_{index}"
+            snapshot["panes"].append({**pane_template, "workspace_id": workspace_id, "tab_id": tab_id,
+                                     "pane_id": pane_id, "terminal_id": terminal_id, "focused": focused,
+                                     "agent_status": status})
+            name = "impl" if focused else f"worker-{workspace_id}-{number}-{index}"
+            snapshot["agents"].append({**agent_template, "workspace_id": workspace_id, "tab_id": tab_id,
+                                      "pane_id": pane_id, "terminal_id": terminal_id,
+                                      "name": name, "focused": focused, "agent_status": status})
+    for workspace_id in pane_numbers:
+        tabs = [tab for tab in snapshot["tabs"] if tab["workspace_id"] == workspace_id]
+        snapshot["workspaces"].append({**workspace_template, "workspace_id": workspace_id,
+                                       "number": len(snapshot["workspaces"]) + 1, "label": "Project",
+                                       "focused": workspace_id == "w1", "pane_count": pane_numbers[workspace_id],
+                                       "tab_count": len(tabs), "active_tab_id": tabs[0]["tab_id"]})
+    state_path.write_text(json.dumps(state))
+    notes_path = root / "state" / "workstreams.json"
+    notes = notes_path.read_bytes()
+    remembered = structured(client.tool("workstream_list"))["workstreams"]
+
+    def observe(expected):
+        before = json.loads(state_path.read_text())
+        inventories = []
+        for surface in ["session_snapshot", "workstream_overview"]:
+            result = structured(client.tool(surface, {"session": "default"}))
+            if surface == "session_snapshot":
+                inventory = result["snapshot"]
+            else:
+                assert result["session_error"] is None
+                assert [report["record"] for report in result["workstreams"]] == remembered
+                inventory = result["live_inventory"]
+            assert inventory["tabs"] == expected["tabs"]
+            for field in ["version", "protocol", "focused_workspace_id", "focused_tab_id", "focused_pane_id"]:
+                assert inventory[field] == expected[field]
+            tabs = {tab["tab_id"]: tab for tab in inventory["tabs"]}
+            panes = {pane["pane_id"]: pane for pane in inventory["panes"]}
+            for tab in inventory["tabs"]:
+                assert tab["pane_count"] == sum(pane["tab_id"] == tab["tab_id"] for pane in inventory["panes"])
+                assert any(workspace["workspace_id"] == tab["workspace_id"] for workspace in inventory["workspaces"])
+            for pane in panes.values():
+                assert tabs[pane["tab_id"]]["workspace_id"] == pane["workspace_id"]
+            for agent in inventory["agents"]:
+                pane = panes[agent["pane_id"]]
+                assert pane["terminal_id"] == agent["terminal_id"]
+                assert tabs[pane["tab_id"]]["agent_status"] == agent["agent_status"]
+            inventories.append(inventory)
+        assert inventories[0] == inventories[1]
+        after = json.loads(state_path.read_text())
+        assert after["snapshot"] == expected
+        assert after["calls"] == before["calls"] + [["--session=default", "api", "snapshot"]] * 2
+        assert notes_path.read_bytes() == notes
+        return inventories[0]
+
+    inventory = observe(snapshot)
+    impl = next(agent for agent in inventory["agents"] if agent["name"] == "impl")
+    pane = next(pane for pane in inventory["panes"] if pane["pane_id"] == impl["pane_id"])
+    assert next(tab for tab in inventory["tabs"] if tab["tab_id"] == pane["tab_id"])["label"] == "impl → inventory"
+    assert [tab["tab_id"] for tab in inventory["tabs"] if tab["label"] == "Review"] == ["w1:t2", "w2:t1"]
+    renamed = "Inventory review α"
+    structured(client.tool("tab_rename", {"session": "default", "tab_id": "w1:t1", "label": renamed}))
+    snapshot["tabs"][0]["label"] = renamed
+    inventory = observe(snapshot)
+    assert next(agent for agent in inventory["agents"] if agent["name"] == "impl") == impl
+    assert inventory["tabs"][0]["label"] == renamed
+
+    corruptions = []
+    missing = copy.deepcopy(snapshot)
+    del missing["tabs"]
+    corruptions.append(missing)
+    for tabs in [None, {}, "tabs", [None]]:
+        malformed = copy.deepcopy(snapshot)
+        malformed["tabs"] = tabs
+        corruptions.append(malformed)
+    for field in ["tab_id", "workspace_id", "number", "focused", "pane_count", "agent_status"]:
+        malformed = copy.deepcopy(snapshot)
+        del malformed["tabs"][0][field]
+        corruptions.append(malformed)
+    for malformed in corruptions:
+        current = json.loads(state_path.read_text())
+        current["snapshot"] = malformed
+        state_path.write_text(json.dumps(current))
+        result = client.tool("session_snapshot", {"session": "default"})
+        assert result.get("isError") and "invalid herdr snapshot response" in result["structuredContent"]["error"]
+        overview = structured(client.tool("workstream_overview", {"session": "default"}))
+        assert "invalid herdr snapshot response" in overview["session_error"]
+        assert overview["live_inventory"] is None
+        assert [report["record"] for report in overview["workstreams"]] == remembered
+        assert overview["workstreams"][0]["locations"][0]["observation"] == "session_unavailable"
+        after = json.loads(state_path.read_text())
+        assert after["snapshot"] == malformed
+        assert after["calls"] == current["calls"] + [["--session=default", "api", "snapshot"]] * 2
+        assert notes_path.read_bytes() == notes
+    current = json.loads(state_path.read_text())
+    current["snapshot"] = snapshot
+    state_path.write_text(json.dumps(current))
+    assert structured(client.tool("workstream_list"))["workstreams"] == remembered
+
+
 def check_tab_close(binary, tool):
     schema = tool["inputSchema"]
     assert set(schema["required"]) == {"session", "tab_id"}
@@ -319,8 +447,8 @@ def main():
             tools = {tool["name"]: tool for tool in client.call("tools/list", {})["tools"]}
             assert set(tools) == {
                 "caller_context", "session_list", "session_snapshot", "workstream_list",
-                "workstream_save", "workstream_overview", "location_open", "agent_inspect",
-                "agent_start", "assignment_send", "agent_read", "agent_wait", "agent_focus",
+                "workstream_save", "workstream_overview", "workstream_get", "workstream_update", "location_open", "agent_inspect",
+                "agent_start", "assignment_send", "assignment_outcome", "agent_prompt", "agent_move", "agent_read", "agent_wait", "agent_focus",
                 "workspace_rename", "tab_rename", "tab_close",
             }
             assert tools["session_snapshot"]["annotations"]["readOnlyHint"]
@@ -340,6 +468,8 @@ def main():
             observed = overview["workstreams"][0]
             assert observed["record"]["workstream"]["status"] == "planned"
             assert observed["locations"][0]["agent"]["agent_status"] == "blocked"
+            assert tools["workstream_overview"]["annotations"]["readOnlyHint"]
+            check_named_inventory(client, root)
             unavailable = structured(client.tool("workstream_overview", {"session": "stopped"}))
             assert unavailable["session_error"]
             assert client.tool("session_snapshot", {"session": "../bad"})["isError"]
@@ -351,8 +481,16 @@ def main():
         finally:
             client.close()
         check_lock_contention(binary, root)
+        client = Client(binary, root)
+        try:
+            check_memory(client, root, tools, binary)
+            check_outcomes(client, root, tools, binary)
+        finally:
+            client.close()
     check_tab_close(binary, tools["tab_close"])
-    print("stdio smoke: discovery, renames/validation/native failures, tab close/isolation/cancellation, snapshots, notes/conflicts, overview, restart, lock contention, and shutdown passed")
+    check_prompts(binary, tools["agent_prompt"])
+    check_moves(binary, tools["agent_move"])
+    print("stdio smoke: discovery, renames/validation/native failures, tab close/isolation/cancellation, named tab inventory/joins/errors, notes/conflicts, overview, restart, lock contention, and shutdown passed")
 
 
 if __name__ == "__main__":
