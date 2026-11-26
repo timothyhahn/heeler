@@ -14,6 +14,8 @@ import tarfile
 import tempfile
 from unittest.mock import patch
 
+from mcp_client import Client, structured
+
 SOURCE = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("heeler_package", SOURCE / "scripts/package.py")
 assert spec is not None and spec.loader is not None
@@ -281,7 +283,6 @@ def check_archive(binary, root, lead, skill):
 
 
 def check_default_mcp(binary, root, env):
-    from stdio_smoke import Client, structured
     root.mkdir()
     fake = root / "herdr"
     fake.write_text(f"#!{sys.executable}\n" + (SOURCE / "tests/fake_herdr.py").read_text())

@@ -145,9 +145,13 @@ impl Herdr {
 }
 
 pub(super) fn validate_label(label: &str) -> Result<()> {
+    // Native global parsing precedes legacy leaves, which have no literal -- separator.
     ensure!(
-        !label.trim().is_empty() && label.len() <= 256 && !label.chars().any(char::is_control),
-        "label must be 1–256 bytes without control characters"
+        !label.trim().is_empty()
+            && label.len() <= 256
+            && !label.chars().any(char::is_control)
+            && !label.starts_with('-'),
+        "label must be 1–256 bytes without control characters or a leading '-'"
     );
     Ok(())
 }
@@ -156,6 +160,39 @@ pub(super) fn validate_label(label: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn unsafe_creation_labels_are_refused_before_any_native_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let herdr = Herdr::new(dir.path().join("must-not-run"));
+        for label in [
+            "--session",
+            "--session=other",
+            "--remote",
+            "--remote-keybindings=local",
+            "--handoff",
+            "-",
+            "bad\nlabel",
+        ] {
+            for location in [
+                OpenLocation::Workspace {
+                    cwd: "/work/project".into(),
+                    label: label.into(),
+                },
+                OpenLocation::Tab {
+                    workspace_id: "w1".into(),
+                    cwd: "/work/project".into(),
+                    label: label.into(),
+                },
+            ] {
+                let error = herdr.open_location("default", location).await.unwrap_err();
+                assert!(error.to_string().contains("label must be"), "{error:#}");
+            }
+        }
+        for label in ["Worker α", "Review --session=embedded", "— unicode dash"] {
+            validate_label(label).unwrap();
+        }
+    }
 
     #[test]
     fn splits_return_pane_info() {

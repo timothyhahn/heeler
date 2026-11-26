@@ -135,10 +135,6 @@ impl Herdr {
         target.validate()?;
         validate_workspace_id(workspace_id)?;
         validate_label(label)?;
-        ensure!(
-            !label.starts_with('-'),
-            "move label must not start with '-'"
-        );
         let observed = self.checked_agent(target).await?;
         ensure!(
             !observed.agent.launch_pending,

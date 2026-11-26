@@ -25,6 +25,9 @@ With no subcommand, Heeler starts stdio MCP. `--herdr-bin` / `HEELER_HERDR_BIN`
 defaults to `herdr` on PATH. `--state-dir` / `HEELER_STATE_DIR` defaults to the OS
 local data directory plus `heeler`; explicit flags take precedence over env.
 Choose absolute paths yourself; no shell or `~` expansion is performed.
+On Unix, each Store access rechecks resolved ancestor-directory barriers, including
+retries/concurrent initialization; existing directories alone do not prove durability.
+Synchronization errors are reported, never repaired by deleting state.
 
 Configuration is harness/cwd/scope dependent. Deliberately select and configure
 that scope; Heeler never edits configuration, trust or permissions. For explicitly
@@ -58,7 +61,10 @@ skill unregistered. Do not add the role to worker defaults automatically.
 
 Compact list/overview reads show intent alongside observations; use focused
 `workstream_get` / revision-checked `workstream_update` for details/bookkeeping.
-Saved submitted/uncertain assignments must never be blindly resent.
+Saved submitted/uncertain assignments must never be blindly resent. All live
+prompts, including rendered assignments, share the 32 KiB LF/tab-only control
+policy; historical stored text keeps its stable field bounds and is not rewritten.
+Create/rename/move labels share a control-free, non-leading-dash 256-byte limit.
 `assignment_outcome` reads one **unauthenticated, unverified** stored claim once
 or waits at most 60 seconds. It reads no reports/panes and promises no parent
 wake or restored background wait; verify evidence separately.
@@ -66,7 +72,10 @@ wake or restored background wait; verify evidence separately.
 Settled `agent_prompt` acknowledgement is submission, not success. Native global
 parsing consumes exact TEXT `--session`, `--remote`, `--remote-keybindings` and
 those names plus `=...`; rephrase them. Busy steering, queued follow-up and
-turn-abort/stop are unsupported. Cancellation cannot undo issued input/actions.
+turn-abort/stop are unsupported. Request cancellation drops unsent read/wait/focus
+steps, not the worker; it cannot undo issued input/actions. Newly observed
+conversation references are pinned across checks where available, not atomically;
+caller-None acknowledgement and stored historical targets remain unverified.
 `agent_move` preserves the terminal but can remove empty source containers;
 readbacks/identity checks are not atomic. `tab_close` requires explicit inspection
 and human authorization, irreversibly terminates contents and refuses observed

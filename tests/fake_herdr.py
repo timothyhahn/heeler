@@ -170,16 +170,22 @@ def outer_globals(raw):
 
 
 args, selected_session = outer_globals(args)
+snapshots = state.get("sessions")
+if snapshots is None:
+    snapshots = {"default": state["snapshot"]}
 if args == ["session", "list", "--json"]:
     save()
-    print(json.dumps({"sessions": [{"name": "default", "default": True, "running": True}]}))
+    print(json.dumps({"sessions": [
+        {"name": name, "default": name == "default", "running": True}
+        for name in snapshots
+    ]}))
     sys.exit(0)
-if selected_session != "default":
-    fail("Only the explicit default local session exists")
+selected_session = selected_session or "default"
+if selected_session not in snapshots:
+    fail("Selected local session does not exist")
+snapshot = snapshots[selected_session]
 if args == ["api", "snapshot"]:
-    reply("session_snapshot", snapshot=state["snapshot"])
-
-snapshot = state["snapshot"]
+    reply("session_snapshot", snapshot=snapshot)
 
 
 def public_number(value):
@@ -412,7 +418,10 @@ if (area, command) in [("workspace", "create"), ("tab", "create"), ("pane", "spl
     opts = options(args[2:])
     source = None
     workspace = None
-    assert opts["no-focus"] is True and opts["cwd"].startswith("/")
+    assert opts.get("no-focus", False) is True
+    # Native create permits omitted cwd; wrapper policy still requires an explicit absolute cwd.
+    cwd = opts.get("cwd", state.get("default_cwd", "/work/default"))
+    assert cwd.startswith("/")
     if area == "workspace":
         workspace_id = f"w{len(snapshot['workspaces']) + 1}"
         workspace = {"workspace_id": workspace_id, "number": len(snapshot["workspaces"]) + 1,
@@ -438,7 +447,7 @@ if (area, command) in [("workspace", "create"), ("tab", "create"), ("pane", "spl
            "pane_count": 1, "agent_status": "idle"}
     pane = {"pane_id": f"{workspace_id}:p{number}", "terminal_id": f"term_{workspace_id}_{number}",
             "workspace_id": workspace_id, "tab_id": tab["tab_id"], "focused": False,
-            "agent_status": "idle", "revision": 1, "cwd": opts["cwd"], "label": None}
+            "agent_status": "idle", "revision": 1, "cwd": cwd, "label": None}
     snapshot["panes"].append(pane)
     if area != "pane":
         snapshot["tabs"].append(tab)
@@ -464,7 +473,8 @@ if command == "start":
              "agent_session": {"source": "herdr:" + opts["kind"], "agent": opts["kind"],
                                "kind": "id", "value": "session-" + name}}
     snapshot["agents"].append(agent)
-    reply("agent_started", agent=agent, argv=[opts["kind"], *args[boundary + 1:]])
+    reply("agent_started", agent={**agent, **state.pop("start_agent_overrides", {})},
+          argv=[opts["kind"], *args[boundary + 1:]])
 
 pane_id = args[2]
 assert pane_id.startswith("w"), "agent target must be the first operand, without a -- marker"
@@ -545,6 +555,7 @@ if command == "prompt":
     reply("agent_prompted", agent=captured)
 if command == "wait":
     assert 0 < int(opts["timeout"]) <= 60000
+    dispatch_gate("wait")
     if state.pop("wait_stays_idle", False):
         reply("agent_info", agent=agent)
     agent["agent_status"] = "done"
@@ -553,14 +564,21 @@ if command == "wait":
         report = Path(prompts[-1]["report_path"])
         assert report.is_relative_to(root), "fake agents only write inside the temporary test root"
         report.write_text("# Synthetic agent report\nNo real code was changed. Checks and agent activity are simulated.\n")
-    reply("agent_info", agent=agent)
+    reply("agent_info", agent={**agent, **state.pop("wait_agent_overrides", {})})
 if command == "read":
     assert opts["format"] == "text" and opts["source"] in ["visible", "recent-unwrapped"]
     assert 0 < int(opts["lines"]) <= 500
+    dispatch_gate("read")
     save()
     print("Report written. Review the report and checks before accepting the work.")
     sys.exit(0)
 if command == "focus":
     snapshot["focused_pane_id"] = pane_id
-    reply("agent_info", agent=agent)
+    dispatch_gate("focus")
+    response = state.pop("focus_response", None)
+    if response is not None:
+        save()
+        print(json.dumps(response))
+        sys.exit(0)
+    reply("agent_info", agent={**agent, **state.pop("focus_agent_overrides", {})})
 fail("Unsupported agent operation")

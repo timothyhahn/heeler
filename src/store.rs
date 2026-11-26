@@ -184,6 +184,27 @@ impl Store {
 }
 
 fn create_state_dir(path: &Path) -> Result<()> {
+    initialize_state_dir(path, sync_directory)
+}
+
+fn initialize_state_dir(path: &Path, sync: impl FnMut(&Path) -> Result<()>) -> Result<()> {
+    ensure_state_dir(path)?;
+    #[cfg(unix)]
+    {
+        // Existence does not prove a previous/concurrent creator completed its barriers.
+        // Resolve relative paths and symlink routes, then persist every actual ancestor link.
+        let resolved = fs::canonicalize(path)?;
+        let mut sync = sync;
+        for parent in resolved.ancestors().skip(1) {
+            sync(parent)?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = sync;
+    Ok(())
+}
+
+fn ensure_state_dir(path: &Path) -> Result<()> {
     match fs::metadata(path) {
         Ok(metadata) => {
             ensure!(metadata.is_dir(), "state path is not a directory");
@@ -196,7 +217,7 @@ fn create_state_dir(path: &Path) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    create_state_dir(parent)?;
+    ensure_state_dir(parent)?;
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -208,8 +229,6 @@ fn create_state_dir(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
         Err(error) => return Err(error.into()),
     }
-    // Persist each new directory's name, including nested state-dir ancestors.
-    sync_directory(parent)?;
     Ok(())
 }
 
@@ -252,6 +271,169 @@ mod tests {
             "report_path": std::env::temp_dir().join("synthetic-review.md"),
             "delivery": "prepared", "outcome": null,
         })).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_initialization_retries_all_ancestor_links_after_sync_failure() {
+        for failed_depth in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("new/nested/state");
+            let mut attempted = Vec::new();
+            let error = initialize_state_dir(&root, |parent| {
+                attempted.push(parent.to_owned());
+                if attempted.len() == failed_depth + 1 {
+                    return Err(std::io::Error::other("injected parent sync failure").into());
+                }
+                sync_directory(parent)
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("injected parent sync"));
+            assert!(root.is_dir());
+            assert!(!root.join("workstreams.json").exists());
+            let expected: Vec<_> = root
+                .canonicalize()
+                .unwrap()
+                .ancestors()
+                .skip(1)
+                .map(Path::to_owned)
+                .collect();
+            let mut retried = Vec::new();
+            initialize_state_dir(&root, |parent| {
+                sync_directory(parent)?;
+                retried.push(parent.to_owned());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(retried, expected);
+            assert!(retried.contains(attempted.last().unwrap()));
+            let store = Store::new(root);
+            assert_eq!(store.save(sample(), 0).unwrap().revision, 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlapping_initializers_establish_their_own_ancestor_barriers() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("shared/left/state");
+        let second = dir.path().join("shared/right/state");
+        let (entered, waiting) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let creator = std::thread::spawn(move || {
+            let mut paused = false;
+            initialize_state_dir(&first, |parent| {
+                if !paused {
+                    paused = true;
+                    entered.send(()).unwrap();
+                    gate.recv().unwrap();
+                    return Err(std::io::Error::other("other creator failed its barrier").into());
+                }
+                sync_directory(parent)
+            })
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut synced = Vec::new();
+        let result = initialize_state_dir(&second, |parent| {
+            sync_directory(parent)?;
+            synced.push(parent.to_owned());
+            Ok(())
+        });
+        release.send(()).unwrap();
+        assert!(creator.join().unwrap().is_err());
+        result.unwrap();
+        let resolved = second.canonicalize().unwrap();
+        assert_eq!(
+            synced,
+            resolved
+                .ancestors()
+                .skip(1)
+                .map(Path::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert!(synced.contains(&dir.path().canonicalize().unwrap().join("shared")));
+        assert!(synced.contains(&dir.path().canonicalize().unwrap()));
+        assert_eq!(Store::new(second).save(sample(), 0).unwrap().revision, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_and_symlink_initialization_flush_resolved_links_without_chmod() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&cwd).unwrap();
+        let existing = dir.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o750)).unwrap();
+        symlink(&existing, dir.path().join("alias")).unwrap();
+        let relative = dir
+            .path()
+            .strip_prefix(&cwd)
+            .unwrap()
+            .join("alias/new/state");
+        let mut synced = Vec::new();
+        initialize_state_dir(&relative, |parent| {
+            sync_directory(parent)?;
+            synced.push(parent.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        let resolved = relative.canonicalize().unwrap();
+        assert_eq!(
+            synced,
+            resolved
+                .ancestors()
+                .skip(1)
+                .map(Path::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(&relative).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(
+            fs::symlink_metadata(dir.path().join("alias"))
+                .unwrap()
+                .is_symlink()
+        );
+        let file = dir.path().join("not-a-directory");
+        fs::write(&file, "keep").unwrap();
+        initialize_state_dir(&file, |_| {
+            panic!("invalid path must not start synchronization")
+        })
+        .unwrap_err();
+        assert_eq!(fs::read_to_string(file).unwrap(), "keep");
+    }
+
+    #[test]
+    fn historical_assignment_reads_do_not_depend_on_live_rendered_limits_or_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_owned());
+        let mut work = sample();
+        let mut history = assignment("history");
+        history.brief = "Historical raw text\u{1b}[201~\u{3}".into();
+        history.constraints = vec!["x".repeat(1024); 16];
+        history.acceptance_criteria = vec!["y".repeat(1024); 16];
+        history.delivery = crate::assignment::Delivery::Submitted;
+        history.outcome = Some("Raw claim\0\u{1b}".into());
+        assert!(history.prompt().len() > 32_768);
+        work.assignments.push(history.clone());
+        store.save(work, 0).unwrap();
+        let before = fs::read(dir.path().join("workstreams.json")).unwrap();
+        assert_eq!(
+            store.get("release").unwrap().workstream.assignments,
+            vec![history]
+        );
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(
+            fs::read(dir.path().join("workstreams.json")).unwrap(),
+            before
+        );
     }
 
     #[test]

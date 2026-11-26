@@ -8,7 +8,7 @@ import socket
 import sys
 import tempfile
 
-from stdio_smoke import Client, structured
+from mcp_client import Client, structured
 
 
 def native_state(root):

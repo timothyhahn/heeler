@@ -6,9 +6,7 @@ import json
 import time
 
 
-def structured(result):
-    assert not result.get("isError"), result
-    return result["structuredContent"]
+from mcp_client import Client, structured
 
 
 def expect_error(result, marker):
@@ -18,7 +16,6 @@ def expect_error(result, marker):
 
 
 def check_outcomes(client, root, tools, binary):
-    from stdio_smoke import Client
     tool = tools["assignment_outcome"]
     schema = tool["inputSchema"]
     assert schema["additionalProperties"] is False and set(schema["required"]) == {"workstream_id", "assignment_id"}

@@ -8,9 +8,7 @@ import sys
 import tempfile
 
 
-def structured(result):
-    assert not result.get("isError"), result
-    return result["structuredContent"]
+from mcp_client import Client, structured
 
 
 def error(result, marker):
@@ -21,7 +19,6 @@ def error(result, marker):
 
 
 def check_moves(binary, tool):
-    from stdio_smoke import Client
     assert set(tool["inputSchema"]["required"]) == {"target", "workspace_id", "label"}
     assert tool["inputSchema"]["additionalProperties"] is False
     assert tool["annotations"]["destructiveHint"] is True

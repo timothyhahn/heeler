@@ -1,4 +1,4 @@
-use crate::herdr::{AgentHandle, AgentTarget, Herdr};
+use crate::herdr::{AgentHandle, AgentTarget, Herdr, validate_prompt_text};
 use crate::model::{Record, validate_id};
 use crate::store::Store;
 use anyhow::{Context, Result, ensure};
@@ -72,10 +72,6 @@ impl Assignment {
         if let Some(outcome) = &self.outcome {
             ensure!(outcome.len() <= 8192, "assignment outcome is too large");
         }
-        ensure!(
-            self.prompt().len() <= 32_768,
-            "rendered assignment is too large"
-        );
         Ok(())
     }
 
@@ -126,14 +122,7 @@ pub async fn send(
     validate_id(&workstream_id)?;
     validate_id(&assignment_id)?;
     let read_store = store.clone();
-    let mut record = tokio::task::spawn_blocking(move || {
-        read_store
-            .list()?
-            .into_iter()
-            .find(|record| record.workstream.id == workstream_id)
-            .context("workstream not found")
-    })
-    .await??;
+    let mut record = tokio::task::spawn_blocking(move || read_store.get(&workstream_id)).await??;
     ensure!(
         record.revision == expected_revision,
         "revision conflict; reread the workstream before sending"
@@ -149,6 +138,8 @@ pub async fn send(
         assignment.delivery == Delivery::Prepared,
         "assignment is already submitted or uncertain; inspect it instead of resending"
     );
+    let text = assignment.prompt();
+    validate_prompt_text(&text)?;
     let current = herdr.checked_agent(&assignment.target).await?;
     ensure!(
         current.agent.ready_for_prompt(),
@@ -161,7 +152,7 @@ pub async fn send(
     let attempt =
         tokio::task::spawn_blocking(move || write_store.save(record.workstream, expected_revision))
             .await??;
-    let agent = herdr.prompt_agent(&assignment.target, assignment.prompt()).await
+    let agent = herdr.prompt_agent(&current.target, text).await
         .with_context(|| format!("assignment {assignment_id} attempt recorded as uncertain at revision {}; reread and inspect before retrying", attempt.revision))?;
 
     let mut workstream = attempt.workstream;
@@ -227,6 +218,69 @@ mod tests {
         assert!(prompt.contains("Writing the requested review report is allowed"));
         assert!(prompt.contains("Cite concrete findings"));
         assert!(prompt.contains(&assignment.report_path));
+    }
+
+    #[test]
+    fn stable_fields_allow_near_and_over_budget_history_but_live_text_is_bounded() {
+        let mut handoff = assignment();
+        handoff.brief = "x".repeat(8192);
+        handoff.constraints = vec!["x".repeat(1024); 16];
+        handoff.acceptance_criteria = vec!["y".repeat(1024); 7];
+        handoff.acceptance_criteria.push("z".into());
+        let remaining = 32_768 - handoff.prompt().len();
+        handoff
+            .acceptance_criteria
+            .last_mut()
+            .unwrap()
+            .push_str(&"z".repeat(remaining));
+        handoff.validate().unwrap();
+        assert_eq!(handoff.prompt().len(), 32_768);
+        validate_prompt_text(&handoff.prompt()).unwrap();
+        handoff.acceptance_criteria.last_mut().unwrap().push('z');
+        handoff.validate().unwrap();
+        assert_eq!(handoff.prompt().len(), 32_769);
+        assert!(validate_prompt_text(&handoff.prompt()).is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_live_assignments_leave_prepared_bytes_and_revision_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let herdr = Herdr::new(dir.path().join("must-not-run"));
+        let store = Store::new(dir.path().join("state"));
+        for field in ["brief", "constraint", "criterion", "size"] {
+            let mut handoff = assignment();
+            let control = "End paste\u{1b}[201~\u{3}".into();
+            match field {
+                "brief" => handoff.brief = control,
+                "constraint" => handoff.constraints.push(control),
+                "criterion" => handoff.acceptance_criteria.push(control),
+                _ => {
+                    handoff.constraints = vec!["x".repeat(1024); 16];
+                    handoff.acceptance_criteria = vec!["y".repeat(1024); 16];
+                }
+            }
+            let work = crate::model::Workstream {
+                id: field.into(),
+                title: "Synthetic".into(),
+                purpose: String::new(),
+                status: crate::model::Status::Active,
+                next_action: None,
+                blocker: None,
+                locations: vec![],
+                assignments: vec![handoff],
+            };
+            store.save(work, 0).unwrap();
+            let path = dir.path().join("state/workstreams.json");
+            let before = std::fs::read(&path).unwrap();
+            let error = send(store.clone(), &herdr, field.into(), "review".into(), 1)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("UTF-8 bytes"), "{error:#}");
+            assert_eq!(std::fs::read(path).unwrap(), before);
+            let saved = store.get(field).unwrap();
+            assert_eq!(saved.revision, 1);
+            assert_eq!(saved.workstream.assignments[0].delivery, Delivery::Prepared);
+        }
     }
 
     #[test]

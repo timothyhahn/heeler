@@ -4,9 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 
 
-def structured(result):
-    assert not result.get("isError"), result
-    return result["structuredContent"]
+from mcp_client import Client, structured
 
 
 def expect_error(result, text=None):
@@ -175,7 +173,6 @@ def check_memory(client, root, tools, binary):
         assert notes_path.read_bytes() == before
 
     # Independent MCP requests compete on the same revision, with no blind retries.
-    from stdio_smoke import Client
     other = Client(binary, root)
     try:
         request = {"workstream_id": "memory-0", "expected_revision": current["revision"],

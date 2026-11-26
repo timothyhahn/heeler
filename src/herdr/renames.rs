@@ -98,11 +98,6 @@ impl Herdr {
         label: &str,
     ) -> Result<RenameResult> {
         validate_label(label)?;
-        // Legacy leaves don't support a bare -- separator. Avoid option parsing entirely.
-        ensure!(
-            !label.starts_with('-'),
-            "rename label must not start with '-'"
-        );
         let value = self
             .session_json(
                 session,

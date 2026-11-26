@@ -8,9 +8,7 @@ import sys
 import tempfile
 
 
-def structured(result):
-    assert not result.get("isError"), result
-    return result["structuredContent"]
+from mcp_client import Client, structured
 
 
 def expect_error(result, text):
@@ -21,7 +19,6 @@ def expect_error(result, text):
 
 
 def check_prompts(binary, tool):
-    from stdio_smoke import Client
     schema = tool["inputSchema"]
     assert set(schema["required"]) == {"target", "text"} and schema["additionalProperties"] is False
     assert schema["properties"]["text"]["type"] == "string"
@@ -144,7 +141,7 @@ def check_prompts(binary, tool):
                                  ("agent", ""), ("agent", "a" * 65), ("agent_session", "a" * 8193)]:
                 expect_error(prompt({**target, field: value}), "too large" if field == "agent_session" else "invalid")
             assert state().get("calls", []) == []
-            expect_error(prompt({**target, "session": "work.test"}), "explicit default local session")
+            expect_error(prompt({**target, "session": "work.test"}), "Selected local session does not exist")
             assert state()["calls"] == [["--session=work.test", "agent", "get", target["pane_id"]]]
 
             for kind, status, ready, pending in [

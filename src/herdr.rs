@@ -4,6 +4,7 @@ mod locations;
 mod moves;
 mod renames;
 
+pub(crate) use agents::validate_prompt_text;
 pub use agents::{AgentHandle, AgentTarget, PromptAcknowledgement, ReadSource, StartAgent};
 pub use close::ClosedTab;
 pub use locations::{Direction, OpenLocation, OpenedLocation};

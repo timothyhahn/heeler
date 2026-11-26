@@ -6,6 +6,33 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
+const MAX_PROMPT_BYTES: usize = 32_768;
+
+/// Live terminal transport policy; historical stored text has separate, stable field bounds.
+pub(crate) fn validate_prompt_text(text: &str) -> Result<()> {
+    // Native globals are consumed across argv before the leaf protects TEXT.
+    if let Some(option) = ["--session", "--remote", "--remote-keybindings"]
+        .into_iter()
+        .find(|option| {
+            text.strip_prefix(*option)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('='))
+        })
+    {
+        bail!(
+            "text matches native herdr CLI global option {option}, which is consumed before prompt parsing; rephrase the message; no native calls were made"
+        );
+    }
+    ensure!(
+        !text.trim().is_empty()
+            && text.len() <= MAX_PROMPT_BYTES
+            && text
+                .chars()
+                .all(|c| !c.is_control() || matches!(c, '\n' | '\t')),
+        "text must be nonblank, at most 32768 UTF-8 bytes, without controls except LF and tab"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTarget {
@@ -215,12 +242,13 @@ impl Herdr {
                 true,
             )
             .await?;
-        let AgentResult::Started { agent } =
-            decode(value).context("invalid launch response; inspect the pane before retrying")?
-        else {
-            bail!("unexpected launch response; inspect the pane before retrying");
-        };
-        AgentHandle::new(session, agent)
+        (|| {
+            let AgentResult::Started { agent } = decode(value)? else {
+                bail!("unexpected launch response");
+            };
+            AgentHandle::new(session, agent)
+        })()
+        .context("agent launch may have taken effect; inspect the pane before retrying; do not retry automatically")
     }
 
     /// One ordinary message to a settled worker, not a steering/queue/abort API.
@@ -229,26 +257,6 @@ impl Herdr {
         target: &AgentTarget,
         text: String,
     ) -> Result<PromptAcknowledgement> {
-        // Native globals are consumed across argv before the leaf protects TEXT.
-        if let Some(option) = ["--session", "--remote", "--remote-keybindings"]
-            .into_iter()
-            .find(|option| {
-                text.strip_prefix(*option)
-                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('='))
-            })
-        {
-            bail!(
-                "text matches native herdr CLI global option {option}, which is consumed before prompt parsing; rephrase the message; no native calls were made"
-            );
-        }
-        ensure!(
-            !text.trim().is_empty()
-                && text.len() <= 32_768
-                && text
-                    .chars()
-                    .all(|c| !c.is_control() || matches!(c, '\n' | '\t')),
-            "text must be nonblank, at most 32768 UTF-8 bytes, without controls except LF and tab"
-        );
         let handle = self.prompt_agent(target, text).await?;
         Ok(PromptAcknowledgement {
             target: target.clone(),
@@ -264,14 +272,11 @@ impl Herdr {
         target: &AgentTarget,
         text: String,
     ) -> Result<AgentHandle> {
+        validate_prompt_text(&text)?;
         let current = self.checked_agent(target).await?;
         ensure!(
             current.agent.ready_for_prompt(),
             "agent is no longer ready; inspect it before retrying"
-        );
-        ensure!(
-            !text.trim().is_empty() && text.len() <= 32_768 && !text.contains('\0'),
-            "invalid or oversized prompt"
         );
         async {
             let value = self
@@ -292,7 +297,7 @@ impl Herdr {
             else {
                 bail!("unexpected submission response; inspect the agent before retrying");
             };
-            target.check(&agent)?;
+            current.target.check(&agent)?;
             AgentHandle::new(&target.session, agent)
         }
         .await
@@ -306,7 +311,7 @@ impl Herdr {
         lines: u32,
     ) -> Result<String> {
         ensure!((1..=500).contains(&lines), "read lines must be 1–500");
-        self.checked_agent(target).await?;
+        let current = self.checked_agent(target).await?;
         let args = Self::session_args(
             &target.session,
             vec![
@@ -322,7 +327,7 @@ impl Herdr {
             ],
         )?;
         let text = self.run(&args, Duration::from_secs(5)).await?;
-        self.checked_agent(target).await?;
+        self.checked_agent(&current.target).await?;
         Ok(text)
     }
 
@@ -331,7 +336,7 @@ impl Herdr {
             (1..=60_000).contains(&timeout_ms),
             "wait timeout must be 1–60000 milliseconds"
         );
-        self.checked_agent(target).await?;
+        let current = self.checked_agent(target).await?;
         let value = self
             .session_json(
                 &target.session,
@@ -349,25 +354,29 @@ impl Herdr {
         let AgentResult::Info { agent } = decode(value)? else {
             bail!("expected agent_info response");
         };
-        target.check(&agent)?;
+        current.target.check(&agent)?;
         AgentHandle::new(&target.session, agent)
     }
 
     pub async fn focus_agent(&self, target: &AgentTarget) -> Result<AgentHandle> {
-        self.checked_agent(target).await?;
-        let value = self
-            .session_json(
-                &target.session,
-                vec!["agent".into(), "focus".into(), target.pane_id.clone()],
-                Duration::from_secs(5),
-                true,
-            )
-            .await?;
-        let AgentResult::Info { agent } = decode(value)? else {
-            bail!("unexpected focus response; inspect the session before retrying");
-        };
-        target.check(&agent)?;
-        AgentHandle::new(&target.session, agent)
+        let current = self.checked_agent(target).await?;
+        async {
+            let value = self
+                .session_json(
+                    &target.session,
+                    vec!["agent".into(), "focus".into(), target.pane_id.clone()],
+                    Duration::from_secs(5),
+                    true,
+                )
+                .await?;
+            let AgentResult::Info { agent } = decode(value)? else {
+                bail!("unexpected focus response");
+            };
+            current.target.check(&agent)?;
+            AgentHandle::new(&target.session, agent)
+        }
+        .await
+        .context("focus may have taken effect; inspect the session before retrying; do not retry automatically")
     }
 }
 
