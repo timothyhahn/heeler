@@ -15,16 +15,20 @@ from memory_smoke import check_memory
 from move_smoke import check_moves
 from outcome_smoke import check_outcomes
 from prompt_smoke import check_prompts
+from packaging_smoke import check_packaging
 
 
 class Client:
-    def __init__(self, binary, root):
+    def __init__(self, binary, root, *, extra_env=None, args=None, cwd=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
         env.update(HERDR_ENV="1", HERDR_SESSION="default", HERDR_PANE_ID="w9:p1")
+        env.update(extra_env or {})
+        if args is None:
+            args = ["--state-dir", str(root / "state"), "--herdr-bin", str(root / "herdr")]
         self.stderr = tempfile.TemporaryFile()
         self.process = subprocess.Popen(
-            [binary, "--state-dir", str(root / "state"), "--herdr-bin", str(root / "herdr")],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr, env=env,
+            [binary, *args],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr, env=env, cwd=cwd,
         )
         assert self.process.stdin is not None and self.process.stdout is not None
         self.stdin = self.process.stdin
@@ -39,6 +43,7 @@ class Client:
                 "clientInfo": {"name": "heeler-smoke", "version": "1"},
             })
             assert initialized["serverInfo"]["name"] == "heeler"
+            self.initialized = initialized
             self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         except BaseException:
             self.abort()
@@ -434,6 +439,7 @@ def check_tab_close(binary, tool):
 
 def main():
     binary = str(Path(sys.argv[1]).resolve())
+    check_packaging(binary)
     with tempfile.TemporaryDirectory(prefix="heeler-smoke-") as directory:
         root = Path(directory)
         fake = root / "herdr"

@@ -1,68 +1,114 @@
 # Heeler
 
 A small Rust management layer for [herdr](https://github.com/herdrdev/herdr).
-Your coding agent acts as lead, using MCP tools to keep track of what you've
-started, where it lives, and what needs attention.
+An ordinary coding agent helps a human keep a few local workstreams straight.
+MCP is the tool interface, not a scheduler or special lead process. Live management
+uses Heeler MCP; missing operations are flagged, never bypassed via CLI.
 
-Still early. It keeps workstream notes, inspects local sessions, and hands saved
-implementation or review assignments to agents in explicit panes. The lead can
-reuse agents or open a location, rename workspace/tab labels without changing
-focus, start an agent, read/wait, and focus it. Live management uses Heeler MCP;
-missing operations are flagged, not bypassed via CLI. There are no automatic
-retries, permission approvals, or background scheduling.
+## Run without a checkout
 
-Use compact workstream list/overview reads for orientation, `workstream_get` for
-one full history, and `workstream_update` for revision-checked notes, new prepared
-assignments, or outcomes. Full reads and whole-record saves remain available.
-`assignment_outcome` reads a stored untrusted claim once or waits up to 60 seconds;
-it does not verify success, inspect report files, schedule work or promise a wake.
-Worker publication uses existing updates only when explicitly authorized and
-already configured to the same store, never overriding task constraints.
-`agent_prompt` sends a one-shot ordinary message to an inspected settled worker,
-without changing notes; acknowledgement is terminal submission, not success.
-TEXT equal to `--session`, `--remote`, `--remote-keybindings`, or starting with
-one of those names plus `=`, must be rephrased: native global parsing consumes it.
-Steering, queued delivery and turn-abort/stop are unsupported.
-`agent_move` transfers an inspected worker into a new labeled tab in an existing
-workspace. It returns a checked new target without rewriting notes; native empty
-source containers may disappear and focus can change despite no-focus intent.
+A maintainer can produce a **host-native local archive** as described below.
+No published downloads or cross-platform support matrix are promised yet.
+Extract a trusted matching archive into a stable directory you choose. Users need
+compatible native herdr and a full-agent MCP harness, not Rust, Cargo, Python or
+the source checkout. Fixtures target herdr 0.9.5; OS/linkage compatibility needs
+verification on each intended host.
 
-`tab_close` irreversibly terminates one explicitly inspected, human-authorized
-tab. It refuses observed last tabs to avoid workspace closure, but a concurrent
-topology change can still make it a last tab. Focus may change; cancellation
-cannot undo an issued close.
+Use the extracted executable's absolute path. Illustrative stdio MCP fields
+(adapt the enclosing schema to your harness):
 
-## Try it
-
-```sh
-cargo build --locked
+```json
+{"command":"/opt/heeler/bin/heeler","args":["--herdr-bin","/opt/herdr/bin/herdr"]}
 ```
 
-Register `target/debug/heeler` with your agent harness as a local stdio MCP
-server, using the binary's absolute path. Herdr must be on `PATH`, or supplied
-with `--herdr-bin`. See `--help` for configuration options.
+With no subcommand, Heeler starts stdio MCP. `--herdr-bin` / `HEELER_HERDR_BIN`
+defaults to `herdr` on PATH. `--state-dir` / `HEELER_STATE_DIR` defaults to the OS
+local data directory plus `heeler`; explicit flags take precedence over env.
+Choose absolute paths yourself; no shell or `~` expansion is performed.
 
-Inside herdr, ask your agent:
+Configuration is harness/cwd/scope dependent. Deliberately select and configure
+that scope; Heeler never edits configuration, trust or permissions. For explicitly
+authorized worker publication, configure **each** participant to the same store
+(e.g. append `--state-dir` and `/home/example/.local/share/heeler` consistently).
+Parent MCP availability does not provision workers; `agent_start` does not either.
 
-> Read `<checkout>/roles/lead/AGENTS.md` and adopt the lead role.
+## Instructions are opt-in
 
-The same file can back a named agent or the skill in `skills/heeler-lead`.
-Start by asking what's running and recording the workstreams you care about.
+Connecting to MCP or discovering assets does **not** adopt the lead role.
+Only when the human explicitly selects a lead, read the shipped
+`roles/lead/AGENTS.md` or print it using the configured absolute binary path:
 
-## Development
+```sh
+/opt/heeler/bin/heeler export lead
+/opt/heeler/bin/heeler export skill
+```
+
+These static stdout exports (also discoverable through `--help`) start no MCP,
+access no Store/herdr and write no files. Deliberate shell redirection is up to
+the user. The archive's `skills/heeler-lead/SKILL.md` is standalone: copy that
+complete file only into a human-selected, supported manual-only skill scope.
+The source wrapper formerly at that path was retired; the source
+`assets/heeler-lead-skill-header.md` is a **template**, not an installable skill.
+Exports combine that header with the one canonical role body at build time.
+`disable-model-invocation: true` is a Pi-specific gate, not a universal Agent
+Skills guarantee. Other harnesses must support manual-only loading or leave the
+skill unregistered. Do not add the role to worker defaults automatically.
+
+## Deliberate coordination, not automation
+
+Compact list/overview reads show intent alongside observations; use focused
+`workstream_get` / revision-checked `workstream_update` for details/bookkeeping.
+Saved submitted/uncertain assignments must never be blindly resent.
+`assignment_outcome` reads one **unauthenticated, unverified** stored claim once
+or waits at most 60 seconds. It reads no reports/panes and promises no parent
+wake or restored background wait; verify evidence separately.
+
+Settled `agent_prompt` acknowledgement is submission, not success. Native global
+parsing consumes exact TEXT `--session`, `--remote`, `--remote-keybindings` and
+those names plus `=...`; rephrase them. Busy steering, queued follow-up and
+turn-abort/stop are unsupported. Cancellation cannot undo issued input/actions.
+`agent_move` preserves the terminal but can remove empty source containers;
+readbacks/identity checks are not atomic. `tab_close` requires explicit inspection
+and human authorization, irreversibly terminates contents and refuses observed
+last tabs. Focus may necessarily change with moves/close. No raw-key/process
+fallback, automatic retries, approvals, remote control or scheduling. No 20-tab
+scale or original-lead restart proof is claimed.
+
+## Maintainer build and local archive
+
+Maintainers need Rust/Cargo plus a native linker; Python 3 (stdlib only) is used
+for archive construction/checks, not by installed users. With cached dependencies:
 
 ```sh
 cargo fmt --check
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo build --locked
+cargo test --offline --locked
+cargo clippy --offline --locked --all-targets -- -D warnings
+cargo build --offline --locked
 python3 tests/stdio_smoke.py target/debug/heeler
 python3 tests/delegation_smoke.py target/debug/heeler
+RUSTFLAGS="--remap-path-prefix=$(pwd)=/build/heeler --remap-path-prefix=$HOME=/build/home" cargo build --offline --release --locked
+mkdir -p target/dist
+python3 scripts/package.py --binary target/release/heeler --host "$(rustc -vV | awk '/^host:/ {print $2}')" --output-dir target/dist
 ```
 
-The fixtures target herdr 0.9.5. Checks use temporary state and fake executables,
-not live panes. The smoke tests require macOS or Linux. The next live trial is a
-small implementation/review handoff inside herdr, with explicit permission to
-create the test panes; the fixture loop isn't proof of live integration.
+The builder executes the explicitly selected **trusted** binary for version and
+exports; it does not build, download, install or release anything. It packages
+only binary, LICENSE, this README, canonical lead and generated skill, plus
+`SHA256SUMS`, under `heeler-<version>-<host>/`. Executable mode is 0755, assets
+0644; a separate `.tar.gz.sha256` covers the archive. Existing outputs are refused,
+not overwritten. Publication is not an atomic archive/digest pair: failures may
+leave partial or complete public outputs, which are never rolled back/deleted.
+Inspect them manually before recovery; do not retry automatically. Only private
+temporary handles are cleaned up. Checksums detect corruption, not authenticity.
+The host label is supplied by the maintainer, not verified cross-target identity.
+Inspect the actual binary/linkage and archive for private build paths before any
+distribution; path-remapping alone is not proof. No static-link/minimum-OS,
+all-harness discovery, release/signing/upload or installation guarantee is made.
+
+Smoke checks use temporary state and fake executables, never live panes; they
+require macOS or Linux. Packaging/static checks are integrated in stdio smoke
+(and can run as `python3 tests/packaging_smoke.py /absolute/path/to/heeler`).
+Source independence is embedded-byte audit plus isolated extracted/cwd tests,
+not a filesystem sandbox. Three independent reviews precede any live trial.
 
 [MIT licensed](LICENSE).

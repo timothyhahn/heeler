@@ -593,7 +593,8 @@ impl ServerHandler for Heeler {
             .with_server_info(Implementation::new("heeler", env!("CARGO_PKG_VERSION")))
             .with_instructions(concat!(
                 "Local workstream memory and attention for a coding agent living in herdr. ",
-                "Read the project's roles/lead/AGENTS.md to adopt the lead role. ",
+                "Connecting or discovering tools does not authorize adopting the lead role. ",
+                "Only on explicit human request, obtain portable instructions with the configured executable's export lead command or shipped roles/lead/AGENTS.md. ",
                 "Start with caller_context and compact workstream_list/workstream_overview. ",
                 "Use workstream_get for full history and workstream_update for focused bookkeeping; summaries are not writable records. ",
                 "Discovery is local only; live reads require an explicit session. ",
